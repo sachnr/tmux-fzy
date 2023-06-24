@@ -336,6 +336,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "nerd-font-symbols"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "82ab273c211780ab48dbb180b333794e3ff390db213552e5f6b5242f0eff1b81"
+
+[[package]]
 name = "once_cell"
 version = "1.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -567,6 +573,7 @@ dependencies = [
  "crossterm 0.26.1",
  "dirs",
  "fuzzy-matcher",
+ "nerd-font-symbols",
  "serde",
  "thiserror",
  "toml",

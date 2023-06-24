@@ -84,7 +84,7 @@ impl Config {
 
         let dir_path = path.0.canonicalize().map_err(ConfErrs::FileWrite)?;
         if self.file_paths.get(&dir_path).is_none() {
-            self.file_paths.insert(dir_path, (path.1.0, path.1.1));
+            self.file_paths.insert(dir_path, (path.1 .0, path.1 .1));
         }
 
         let mut file = OpenOptions::new()

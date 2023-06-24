@@ -12,7 +12,7 @@ use tui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Span, Spans},
-    widgets::{Block, Borders, List, ListItem, Paragraph},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
     Frame, Terminal,
 };
 
@@ -60,8 +60,7 @@ struct App {
     paths: Vec<PathBuf>,
     filter: VecDeque<(PathBuf, Vec<usize>)>,
     active: Vec<String>,
-    curr: i16,
-    rect: i16,
+    list_state: ListState,
 }
 
 impl App {
@@ -71,8 +70,7 @@ impl App {
             filter: VecDeque::new(),
             active: tmux::sessions(),
             paths,
-            curr: 0,
-            rect: 0,
+            list_state: ListState::default(),
         }
     }
 
@@ -85,32 +83,19 @@ impl App {
     }
 
     fn next(&mut self) {
-        self.curr += 1;
         let len = self.filter.len() as i16;
-        match (self.curr, self.rect) {
-            (curr, size) if curr > size => {
-                let first = self.filter.pop_front().unwrap();
-                self.filter.push_back(first);
-                self.curr -= 1;
+        if let Some(pos) = self.list_state.selected() {
+            if pos < (len - 1) as usize {
+                self.list_state.select(Some(pos + 1));
             }
-            (curr, _) if curr >= len => {
-                self.curr = len - 1;
-            }
-            _ => {}
         }
     }
 
     fn prev(&mut self) {
-        self.curr -= 1;
-        let len = self.filter.len() as i16;
-        match (self.curr, self.rect) {
-            (curr, size) if curr < 0 && len > size => {
-                let last = self.filter.pop_back().unwrap();
-                self.filter.push_front(last);
-                self.curr += 1;
+        if let Some(pos) = self.list_state.selected() {
+            if pos > 0 {
+                self.list_state.select(Some(pos - 1));
             }
-            (curr, _) if curr < 0 => self.curr = 0,
-            _ => {}
         }
     }
 
@@ -120,7 +105,7 @@ impl App {
         for path in self.paths.clone() {
             let path_str = path.to_str().unwrap();
             if let Some((_, indices)) = matcher.fuzzy_indices(path_str, &self.user_input) {
-                matched.push_front((path, indices));
+                matched.push_back((path, indices));
             }
         }
         self.filter = matched;
@@ -128,6 +113,7 @@ impl App {
 }
 
 fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result<(), std::io::Error> {
+    app.list_state.select(Some(0));
     loop {
         terminal.draw(|f| ui(f, &mut app))?;
 
@@ -141,8 +127,8 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result<(), s
             match (code, modifiers) {
                 (event::KeyCode::Char(c), event::KeyModifiers::NONE) => {
                     app.user_input.push(c);
+                    app.list_state.select(Some(0));
                     app.update();
-                    app.curr = 0;
                 }
                 (event::KeyCode::Backspace, event::KeyModifiers::NONE) => {
                     _ = app.user_input.pop();
@@ -152,7 +138,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result<(), s
                     if app.filter.is_empty() {
                         continue;
                     }
-                    let path = app.filter[app.curr as usize].0.clone();
+                    let path = app.filter[app.list_state.selected().unwrap()].0.clone();
                     tmux::run(path)?;
                     app.active = tmux::sessions();
                     return Ok(());
@@ -176,10 +162,11 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
         .constraints([Constraint::Min(3), Constraint::Percentage(100)].as_ref())
         .split(size);
 
-    app.rect = (size.height - 7) as i16;
-
     let input = Paragraph::new(Spans::from(vec![
-        Span::styled("   ", Style::default().fg(Color::Red)),
+        Span::styled(
+            format!(" {}  ", nerd_font_symbols::fa::FA_SEARCH),
+            Style::default().fg(Color::Red),
+        ),
         Span::raw(app.user_input.clone()),
     ]))
     .style(Style::default().fg(Color::White))
@@ -199,64 +186,52 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
     let paths: Vec<ListItem> = app
         .filter
         .iter()
-        .enumerate()
-        .map(|(i, paths)| {
-            let (paths, indices) = paths;
-            let active = || -> bool {
-                let path = paths.file_name().unwrap().to_str().unwrap();
-                for session in &app.active {
-                    if path.eq(session) {
-                        return true;
-                    }
-                }
-                false
-            };
-            let sign = {
-                if active() {
-                    " [Active]"
+        .map(|paths| {
+            let path = paths.0.to_str().unwrap();
+            let dir_name = paths.0.file_name().unwrap().to_str().unwrap();
+            let contains = |dir_name: &str| -> bool { app.active.contains(&dir_name.to_string()) };
+            let colored = color_fzf(path, &paths.1);
+            let content = {
+                if contains(dir_name) {
+                    let icon = format!("{} ", nerd_font_symbols::md::MD_STAR_CIRCLE);
+                    let active = Span::styled(icon, Style::default().fg(Color::Green));
+                    ListItem::new(Spans::from(
+                        vec![active]
+                            .into_iter()
+                            .chain(colored)
+                            .collect::<Vec<Span>>(),
+                    ))
                 } else {
-                    ""
+                    let icon = Span::raw("");
+                    ListItem::new(Spans::from(
+                        vec![icon].into_iter().chain(colored).collect::<Vec<Span>>(),
+                    ))
                 }
             };
-
-            let content = if i == app.curr as usize {
-                let colored = color_fzf_bold(paths.to_str().unwrap(), indices);
-                Spans::from(
-                    vec![Span::styled("❯ ", Style::default().fg(Color::Green))]
-                        .into_iter()
-                        .chain(colored)
-                        .chain(vec![Span::styled(sign, Style::default().fg(Color::Green))])
-                        .collect::<Vec<Span>>(),
-                )
-            } else {
-                let colored = color_fzf(paths.to_str().unwrap(), indices);
-                Spans::from(
-                    colored
-                        .into_iter()
-                        .chain(vec![Span::styled(sign, Style::default().fg(Color::Green))])
-                        .collect::<Vec<Span>>(),
-                )
-            };
-            ListItem::new(content)
+            content
         })
         .collect();
 
-    let list = List::new(paths).block(
-        Block::default().title(Span::styled(
-            "  Results  ",
-            Style::default()
-                .bg(Color::Green)
-                .fg(Color::Black)
-                .add_modifier(Modifier::BOLD),
-        )),
-    );
+    let arrow = nerd_font_symbols::fa::FA_CHEVRON_RIGHT;
+    let list = List::new(paths)
+        .block(
+            Block::default().title(Span::styled(
+                "  Results  ",
+                Style::default()
+                    .bg(Color::Green)
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD),
+            )),
+        )
+        .highlight_symbol(arrow)
+        .highlight_style(Style::default().add_modifier(Modifier::BOLD));
 
     f.render_widget(input, chunks[0]);
     f.set_cursor(
         chunks[0].x + app.user_input.len() as u16 + 4,
         chunks[0].y + 1,
     );
-    f.render_widget(list, chunks[1]);
+    f.render_stateful_widget(list, chunks[1], &mut app.list_state)
 }
 
 fn color_fzf<'a>(input: &'a str, indices: &[usize]) -> Vec<Span<'a>> {
@@ -266,28 +241,6 @@ fn color_fzf<'a>(input: &'a str, indices: &[usize]) -> Vec<Span<'a>> {
         .map(|(i, c)| {
             if !indices.contains(&i) {
                 Span::styled(c.to_string(), Style::default().fg(Color::White))
-            } else {
-                Span::styled(
-                    c.to_string(),
-                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                )
-            }
-        })
-        .collect::<Vec<Span>>()
-}
-
-fn color_fzf_bold<'a>(input: &'a str, indices: &[usize]) -> Vec<Span<'a>> {
-    input
-        .chars()
-        .enumerate()
-        .map(|(i, c)| {
-            if !indices.contains(&i) {
-                Span::styled(
-                    c.to_string(),
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
-                )
             } else {
                 Span::styled(
                     c.to_string(),
