@@ -6,7 +6,7 @@ use crossterm::{
     terminal::{self, disable_raw_mode, enable_raw_mode, EnterAlternateScreen},
 };
 use fuzzy_matcher::FuzzyMatcher;
-use std::path::PathBuf;
+use std::{collections::VecDeque, path::PathBuf};
 use tui::{
     backend::{Backend, CrosstermBackend},
     layout::{Constraint, Direction, Layout},
@@ -36,7 +36,8 @@ fn render(config: &mut Config) -> Result<(), std::io::Error> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let app = App::new(config.expand());
+    let mut app = App::new(config.expand());
+    app.filter();
 
     if let Err(e) = run_app(&mut terminal, app) {
         eprintln!("{e}");
@@ -57,20 +58,72 @@ fn render(config: &mut Config) -> Result<(), std::io::Error> {
 struct App {
     user_input: String,
     paths: Vec<PathBuf>,
-    filter: Vec<(PathBuf, Vec<usize>)>,
+    filter: VecDeque<(PathBuf, Vec<usize>)>,
     active: Vec<String>,
     curr: i16,
+    rect: i16,
 }
 
 impl App {
     fn new(paths: Vec<PathBuf>) -> Self {
         Self {
             user_input: String::new(),
-            filter: Vec::new(),
+            filter: VecDeque::new(),
             active: tmux::sessions(),
             paths,
             curr: 0,
+            rect: 0,
         }
+    }
+
+    fn filter(&mut self) {
+        self.filter = self
+            .paths
+            .iter()
+            .map(|pathbuf| (pathbuf.clone(), vec![]))
+            .collect();
+    }
+
+    fn next(&mut self) {
+        self.curr += 1;
+        let len = self.filter.len() as i16;
+        match (self.curr, self.rect) {
+            (curr, size) if curr > size => {
+                let first = self.filter.pop_front().unwrap();
+                self.filter.push_back(first);
+                self.curr -= 1;
+            }
+            (curr, _) if curr >= len => {
+                self.curr = len - 1;
+            }
+            _ => {}
+        }
+    }
+
+    fn prev(&mut self) {
+        self.curr -= 1;
+        let len = self.filter.len() as i16;
+        match (self.curr, self.rect) {
+            (curr, size) if curr < 0 && len > size => {
+                let last = self.filter.pop_back().unwrap();
+                self.filter.push_front(last);
+                self.curr += 1;
+            }
+            (curr, _) if curr < 0 => self.curr = 0,
+            _ => {}
+        }
+    }
+
+    fn update(&mut self) {
+        let matcher = fuzzy_matcher::skim::SkimMatcherV2::default();
+        let mut matched = VecDeque::new();
+        for path in self.paths.clone() {
+            let path_str = path.to_str().unwrap();
+            if let Some((_, indices)) = matcher.fuzzy_indices(path_str, &self.user_input) {
+                matched.push_front((path, indices));
+            }
+        }
+        self.filter = matched;
     }
 }
 
@@ -86,12 +139,14 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result<(), s
         }) = event::read()?
         {
             match (code, modifiers) {
-                (event::KeyCode::Esc, event::KeyModifiers::NONE) => {
-                    return Ok(());
-                }
                 (event::KeyCode::Char(c), event::KeyModifiers::NONE) => {
                     app.user_input.push(c);
+                    app.update();
                     app.curr = 0;
+                }
+                (event::KeyCode::Backspace, event::KeyModifiers::NONE) => {
+                    _ = app.user_input.pop();
+                    app.update();
                 }
                 (event::KeyCode::Enter, event::KeyModifiers::NONE) => {
                     if app.filter.is_empty() {
@@ -102,41 +157,17 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result<(), s
                     app.active = tmux::sessions();
                     return Ok(());
                 }
-                (event::KeyCode::Backspace, event::KeyModifiers::NONE) => _ = app.user_input.pop(),
-                (event::KeyCode::Char('c'), event::KeyModifiers::CONTROL) => {
-                    return Ok(());
-                }
-                (event::KeyCode::Char('j'), event::KeyModifiers::CONTROL) => {
-                    app.curr += 1;
-                    if app.curr >= app.filter.len() as i16 {
-                        app.curr = app.filter.len() as i16 - 1;
-                    }
-                }
-                (event::KeyCode::Char('k'), event::KeyModifiers::CONTROL) => {
-                    app.curr -= 1;
-                    if app.curr <= 0 {
-                        app.curr = 0
-                    }
-                }
+                (event::KeyCode::Esc, event::KeyModifiers::NONE) => return Ok(()),
+                (event::KeyCode::Char('c'), event::KeyModifiers::CONTROL) => return Ok(()),
+                (event::KeyCode::Char('j'), event::KeyModifiers::CONTROL) => app.next(),
+                (event::KeyCode::Char('k'), event::KeyModifiers::CONTROL) => app.prev(),
                 _ => {}
             }
         }
     }
 }
 
-fn fzf(app: &mut App) -> Vec<(PathBuf, Vec<usize>)> {
-    let matcher = fuzzy_matcher::skim::SkimMatcherV2::default();
-    let mut matched = Vec::new();
-    for path in app.paths.clone() {
-        let path_str = path.to_str().unwrap();
-        if let Some((_, indices)) = matcher.fuzzy_indices(path_str, &app.user_input) {
-            matched.push((path, indices));
-        }
-    }
-    matched
-}
-
-fn ui<B: Backend>(f: &mut Frame<B>, mut app: &mut App) {
+fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
     let size = f.size();
 
     let chunks = Layout::default()
@@ -144,6 +175,8 @@ fn ui<B: Backend>(f: &mut Frame<B>, mut app: &mut App) {
         .margin(1)
         .constraints([Constraint::Min(3), Constraint::Percentage(100)].as_ref())
         .split(size);
+
+    app.rect = (size.height - 7) as i16;
 
     let input = Paragraph::new(Spans::from(vec![
         Span::styled("   ", Style::default().fg(Color::Red)),
@@ -163,7 +196,6 @@ fn ui<B: Backend>(f: &mut Frame<B>, mut app: &mut App) {
             )),
     );
 
-    app.filter = fzf(app);
     let paths: Vec<ListItem> = app
         .filter
         .iter()
@@ -186,6 +218,7 @@ fn ui<B: Backend>(f: &mut Frame<B>, mut app: &mut App) {
                     ""
                 }
             };
+
             let content = if i == app.curr as usize {
                 let colored = color_fzf_bold(paths.to_str().unwrap(), indices);
                 Spans::from(
