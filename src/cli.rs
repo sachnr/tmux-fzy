@@ -77,9 +77,10 @@ pub(crate) fn run() {
             }
             Commands::Del { paths } => {
                 for path in paths {
-                    config.file_paths.remove_entry(&path);
+                    let path = path.canonicalize().expect("Directory not found");
+                    config.file_paths.remove(&path);
+                    config.write_all().expect("Failed to Write to the file");
                 }
-                config.write_all().expect("Failed to Write to the file");
             }
         },
     }

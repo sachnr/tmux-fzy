@@ -105,8 +105,8 @@ impl Config {
             .join("tmux-fzy/config.toml");
 
         let mut file = OpenOptions::new()
-            .append(false)
             .write(true)
+            .truncate(true)
             .open(config_path)
             .map_err(ConfErrs::FileOpen)?;
 

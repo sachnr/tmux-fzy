@@ -202,10 +202,7 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
                             .collect::<Vec<Span>>(),
                     ))
                 } else {
-                    let icon = Span::raw("");
-                    ListItem::new(Spans::from(
-                        vec![icon].into_iter().chain(colored).collect::<Vec<Span>>(),
-                    ))
+                    ListItem::new(Spans::from(colored))
                 }
             };
             content

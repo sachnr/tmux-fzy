@@ -18,3 +18,10 @@ cargo install --path .
 make sure you have `.cargo/bin` in your path
 
 `export PATH="${PATH}:$HOME/.cargo/bin"`
+
+# Usage
+
+this will add all the subdirs in the directory to the list
+```
+tmux-fzy add --mindepth 1 --maxdepth 1 ~/Music
+```
