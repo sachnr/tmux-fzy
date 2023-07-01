@@ -105,6 +105,7 @@ impl Config {
             .join("tmux-fzy/config.toml");
 
         let mut file = OpenOptions::new()
+            .append(false)
             .write(true)
             .truncate(true)
             .open(config_path)
@@ -126,7 +127,7 @@ impl Config {
                     .into_iter()
                     .filter_map(|entry| {
                         let entry = entry.ok()?;
-                        let path = entry.path().to_owned(); // Clone the PathBuf
+                        let path = entry.path().to_owned();
                         if entry.file_type().is_dir() {
                             Some(path)
                         } else {

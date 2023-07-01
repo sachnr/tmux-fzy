@@ -6,7 +6,7 @@ use crossterm::{
     terminal::{self, disable_raw_mode, enable_raw_mode, EnterAlternateScreen},
 };
 use fuzzy_matcher::FuzzyMatcher;
-use std::{collections::VecDeque, path::PathBuf};
+use std::path::PathBuf;
 use tui::{
     backend::{Backend, CrosstermBackend},
     layout::{Constraint, Direction, Layout},
@@ -36,8 +36,7 @@ fn render(config: &mut Config) -> Result<(), std::io::Error> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(config.expand());
-    app.filter();
+    let app = App::new(config.expand());
 
     if let Err(e) = run_app(&mut terminal, app) {
         eprintln!("{e}");
@@ -58,7 +57,8 @@ fn render(config: &mut Config) -> Result<(), std::io::Error> {
 struct App {
     user_input: String,
     paths: Vec<PathBuf>,
-    filter: VecDeque<(PathBuf, Vec<usize>)>,
+    // is active, index, highlighted text
+    filter: Vec<(bool, usize, Vec<usize>)>,
     active: Vec<String>,
     list_state: ListState,
 }
@@ -67,19 +67,11 @@ impl App {
     fn new(paths: Vec<PathBuf>) -> Self {
         Self {
             user_input: String::new(),
-            filter: VecDeque::new(),
+            filter: Vec::new(),
             active: tmux::sessions(),
             paths,
             list_state: ListState::default(),
         }
-    }
-
-    fn filter(&mut self) {
-        self.filter = self
-            .paths
-            .iter()
-            .map(|pathbuf| (pathbuf.clone(), vec![]))
-            .collect();
     }
 
     fn next(&mut self) {
@@ -101,11 +93,11 @@ impl App {
 
     fn update(&mut self) {
         let matcher = fuzzy_matcher::skim::SkimMatcherV2::default();
-        let mut matched = VecDeque::new();
-        for path in self.paths.clone() {
+        let mut matched = Vec::new();
+        for (i, path) in self.paths.iter().enumerate() {
             let path_str = path.to_str().unwrap();
             if let Some((_, indices)) = matcher.fuzzy_indices(path_str, &self.user_input) {
-                matched.push_back((path, indices));
+                matched.push((false, i, indices));
             }
         }
         self.filter = matched;
@@ -113,6 +105,7 @@ impl App {
 }
 
 fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result<(), std::io::Error> {
+    app.update();
     app.list_state.select(Some(0));
     loop {
         terminal.draw(|f| ui(f, &mut app))?;
@@ -138,7 +131,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result<(), s
                     if app.filter.is_empty() {
                         continue;
                     }
-                    let path = app.filter[app.list_state.selected().unwrap()].0.clone();
+                    let path = app.paths[app.filter[app.list_state.selected().unwrap()].1].clone();
                     tmux::run(path)?;
                     app.active = tmux::sessions();
                     return Ok(());
@@ -162,12 +155,13 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
         .constraints([Constraint::Min(3), Constraint::Percentage(100)].as_ref())
         .split(size);
 
+    let user_input: &str = app.user_input.as_ref();
     let input = Paragraph::new(Spans::from(vec![
         Span::styled(
             format!(" {}  ", nerd_font_symbols::fa::FA_SEARCH),
             Style::default().fg(Color::Red),
         ),
-        Span::raw(app.user_input.clone()),
+        Span::raw(user_input),
     ]))
     .style(Style::default().fg(Color::White))
     .block(
@@ -183,16 +177,21 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
             )),
     );
 
-    let paths: Vec<ListItem> = app
-        .filter
+    for paths in app.filter.iter_mut() {
+        let dir_name = app.paths[paths.1].file_name().unwrap().to_str().unwrap();
+        let contains = |dir_name: &str| -> bool { app.active.contains(&dir_name.to_string()) };
+        paths.0 = contains(dir_name);
+    }
+
+    app.filter.sort_by_key(|&(contains, _, _)| !contains);
+
+    let paths_sorted: Vec<ListItem> = app.filter
         .iter()
-        .map(|paths| {
-            let path = paths.0.to_str().unwrap();
-            let dir_name = paths.0.file_name().unwrap().to_str().unwrap();
-            let contains = |dir_name: &str| -> bool { app.active.contains(&dir_name.to_string()) };
-            let colored = color_fzf(path, &paths.1);
-            let content = {
-                if contains(dir_name) {
+        .map(|(contains, path, highlight)| {
+            let path = app.paths[*path].to_str().unwrap();
+            let colored = color_fzf(path, highlight);
+            let items = {
+                if *contains {
                     let icon = format!("{} ", nerd_font_symbols::md::MD_STAR_CIRCLE);
                     let active = Span::styled(icon, Style::default().fg(Color::Green));
                     ListItem::new(Spans::from(
@@ -205,12 +204,12 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
                     ListItem::new(Spans::from(colored))
                 }
             };
-            content
+            items
         })
         .collect();
 
     let arrow = nerd_font_symbols::fa::FA_CHEVRON_RIGHT;
-    let list = List::new(paths)
+    let list = List::new(paths_sorted)
         .block(
             Block::default().title(Span::styled(
                 "  Results  ",
