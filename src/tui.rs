@@ -9,7 +9,7 @@ use fuzzy_matcher::FuzzyMatcher;
 use std::path::PathBuf;
 use tui::{
     backend::{Backend, CrosstermBackend},
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Span, Spans},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
@@ -155,12 +155,17 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
         .constraints([Constraint::Min(3), Constraint::Percentage(100)].as_ref())
         .split(size);
 
+    let total = format!("{}/{}", app.filter.len(), app.paths.len());
+    let len = Paragraph::new(Span::styled(
+        &total,
+        Style::default().fg(Color::Gray).add_modifier(Modifier::DIM),
+    ))
+    .style(Style::default().fg(Color::Gray));
+
     let user_input: &str = app.user_input.as_ref();
+    let search_icon = format!(" {}  ", nerd_font_symbols::fa::FA_SEARCH);
     let input = Paragraph::new(Spans::from(vec![
-        Span::styled(
-            format!(" {}  ", nerd_font_symbols::fa::FA_SEARCH),
-            Style::default().fg(Color::Red),
-        ),
+        Span::styled(search_icon, Style::default().fg(Color::Red)),
         Span::raw(user_input),
     ]))
     .style(Style::default().fg(Color::White))
@@ -179,13 +184,13 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
 
     for paths in app.filter.iter_mut() {
         let dir_name = app.paths[paths.1].file_name().unwrap().to_str().unwrap();
-        let contains = |dir_name: &str| -> bool { app.active.contains(&dir_name.to_string()) };
-        paths.0 = contains(dir_name);
+        paths.0 = app.active.contains(&dir_name.to_string());
     }
 
     app.filter.sort_by_key(|&(contains, _, _)| !contains);
 
-    let paths_sorted: Vec<ListItem> = app.filter
+    let paths_sorted: Vec<ListItem> = app
+        .filter
         .iter()
         .map(|(contains, path, highlight)| {
             let path = app.paths[*path].to_str().unwrap();
@@ -226,6 +231,15 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
     f.set_cursor(
         chunks[0].x + app.user_input.len() as u16 + 4,
         chunks[0].y + 1,
+    );
+    f.render_widget(
+        len,
+        Rect::new(
+            chunks[0].width - total.len() as u16,
+            chunks[0].y + 1,
+            total.len() as u16,
+            1,
+        ),
     );
     f.render_stateful_widget(list, chunks[1], &mut app.list_state)
 }
