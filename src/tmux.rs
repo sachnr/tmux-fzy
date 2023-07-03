@@ -36,6 +36,17 @@ struct Tmux {
     basename: String,
 }
 
+pub(crate) fn kill_session(path: PathBuf) -> Result<(), std::io::Error> {
+    let basename = path.file_name().unwrap().to_str().unwrap();
+    Command::new("tmux")
+        .arg("kill-session")
+        .arg("-t")
+        .arg(basename)
+        .output()?;
+
+    Ok(())
+}
+
 pub(crate) fn sessions() -> Vec<String> {
     let output = Command::new("tmux")
         .arg("ls")

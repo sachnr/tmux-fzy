@@ -12,7 +12,7 @@ use tui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Span, Spans},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
     Frame, Terminal,
 };
 
@@ -61,6 +61,7 @@ struct App {
     filter: Vec<(bool, usize, Vec<usize>)>,
     active: Vec<String>,
     list_state: ListState,
+    show_popup: bool,
 }
 
 impl App {
@@ -71,6 +72,7 @@ impl App {
             active: tmux::sessions(),
             paths,
             list_state: ListState::default(),
+            show_popup: false,
         }
     }
 
@@ -118,6 +120,28 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result<(), s
         }) = event::read()?
         {
             match (code, modifiers) {
+                (event::KeyCode::Char('y'), event::KeyModifiers::NONE) => {
+                    if app.show_popup {
+                        let path =
+                            app.paths[app.filter[app.list_state.selected().unwrap()].1].clone();
+                        tmux::kill_session(path)?;
+                        app.active = tmux::sessions();
+                        app.show_popup = false;
+                    } else {
+                        app.user_input.push('y');
+                        app.list_state.select(Some(0));
+                        app.update();
+                    }
+                }
+                (event::KeyCode::Char('n'), event::KeyModifiers::NONE) => {
+                    if app.show_popup {
+                        app.show_popup = false;
+                    } else {
+                        app.user_input.push('n');
+                        app.list_state.select(Some(0));
+                        app.update();
+                    }
+                }
                 (event::KeyCode::Char(c), event::KeyModifiers::NONE) => {
                     app.user_input.push(c);
                     app.list_state.select(Some(0));
@@ -136,10 +160,17 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result<(), s
                     app.active = tmux::sessions();
                     return Ok(());
                 }
-                (event::KeyCode::Esc, event::KeyModifiers::NONE) => return Ok(()),
+                (event::KeyCode::Esc, event::KeyModifiers::NONE) => {
+                    if app.show_popup {
+                        app.show_popup = false;
+                    } else {
+                        return Ok(());
+                    }
+                }
                 (event::KeyCode::Char('c'), event::KeyModifiers::CONTROL) => return Ok(()),
                 (event::KeyCode::Char('j'), event::KeyModifiers::CONTROL) => app.next(),
                 (event::KeyCode::Char('k'), event::KeyModifiers::CONTROL) => app.prev(),
+                (event::KeyCode::Char('x'), event::KeyModifiers::CONTROL) => app.show_popup = true,
                 _ => {}
             }
         }
@@ -241,7 +272,75 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
             1,
         ),
     );
-    f.render_stateful_widget(list, chunks[1], &mut app.list_state)
+    f.render_stateful_widget(list, chunks[1], &mut app.list_state);
+
+    if app.show_popup {
+        let para = Paragraph::new(vec![
+            Spans::from(Span::styled(
+                "Are you sure?",
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            Spans::from(""),
+            Spans::from(vec![
+                Span::styled(
+                    " [Y]",
+                    Style::default()
+                        .fg(Color::LightGreen)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("Yes "),
+                Span::styled(
+                    " [N]",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("No "),
+            ]),
+        ])
+        .alignment(tui::layout::Alignment::Center)
+        .wrap(tui::widgets::Wrap { trim: true })
+        .block(
+            Block::default()
+                .title(Span::styled(
+                    "  Close Session  ",
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .title_alignment(tui::layout::Alignment::Left)
+                .borders(Borders::ALL)
+                .style(Style::default().fg(Color::Gray)),
+        );
+        let area = centered_rect(30, 10, size);
+        f.render_widget(Clear, area); //this clears out the background
+        f.render_widget(para, area);
+    }
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(
+            [
+                Constraint::Percentage((100 - percent_y) / 2),
+                Constraint::Min(percent_y),
+                Constraint::Percentage((100 - percent_y) / 2),
+            ]
+            .as_ref(),
+        )
+        .split(r);
+
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(
+            [
+                Constraint::Percentage((100 - percent_x) / 2),
+                Constraint::Percentage(percent_x),
+                Constraint::Percentage((100 - percent_x) / 2),
+            ]
+            .as_ref(),
+        )
+        .split(popup_layout[1])[1]
 }
 
 fn color_fzf<'a>(input: &'a str, indices: &[usize]) -> Vec<Span<'a>> {
