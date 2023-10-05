@@ -1,8 +1,12 @@
 [package]
 name = "tmux-fzy"
-version = "0.2.0"
+version = "0.2.1"
+rust-version = "1.73.0"
 edition = "2021"
 license = "MIT"
+license-file = "LICENSE"
+repository = "https://github.com/sachnr/tmux-fzy"
+readme = "readme.md"
 description = "A simple project manager for tmux" 
 
 [[bin]]

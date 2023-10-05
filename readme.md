@@ -1,6 +1,6 @@
 # Tmux-fzy
 
-A simple project manager for tmux that allows you to easily switch between sessions and open new sessions.
+A simple project manager for tmux.
 
 # Screenshot
 
@@ -8,11 +8,11 @@ A simple project manager for tmux that allows you to easily switch between sessi
 
 # Installation
 
-`cd` into the cloned repo
+## From source
 
 ```
 cargo build --release
-cargo install --path .
+cargo install --path . --force
 ```
 
 make sure you have `.cargo/bin` in your path
@@ -21,7 +21,10 @@ make sure you have `.cargo/bin` in your path
 
 # Usage
 
-this will add all the subdirs in the directory to the list
+how to add dirs
+
 ```
 tmux-fzy add --mindepth 1 --maxdepth 1 ~/Music
 ```
+
+_dirs are stored in `XDG_CACHE_HOME/.tmux-fzy`_
