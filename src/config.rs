@@ -1,141 +1,162 @@
-use serde::Deserialize;
-use serde::Serialize;
-use std::collections::HashMap;
-use std::fs::File;
-use std::fs::OpenOptions;
-use std::io::Read;
-use std::io::Write;
-use std::path::PathBuf;
-use thiserror::Error;
+use std::{
+    collections::HashMap,
+    env,
+    ffi::OsString,
+    fs::{self, File, OpenOptions},
+    io::{Read, Write},
+    path::PathBuf,
+    str::FromStr,
+};
+
 use walkdir::WalkDir;
 
-pub(crate) fn load() -> Config {
-    let mut config = Config::new();
-    match config.read() {
-        Ok(config) => config,
-        Err(err) => eprintln!("{}", err),
-    };
-    config
+use crate::Error;
+
+#[derive(Debug)]
+pub struct Configuration(pub HashMap<String, Flags>);
+
+#[derive(Debug)]
+pub struct Flags {
+    pub min_depth: usize,
+    pub max_depth: usize,
 }
 
-#[derive(Debug, Error)]
-pub(crate) enum ConfErrs {
-    #[error("Failed to determine the configuration directory")]
-    ConfigDir,
-
-    #[error("Failed to open or create the file: {0}")]
-    #[from(io::Error)]
-    FileOpen(#[source] std::io::Error),
-
-    #[error("Failed to write to the file: {0}")]
-    #[from(io::Error)]
-    FileWrite(#[source] std::io::Error),
-
-    #[error("Failed to read the file: {0}")]
-    #[from(io::Error)]
-    Read(#[source] std::io::Error),
-
-    #[error("Failed to deserialize the data: {0}")]
-    #[from(toml::de::Error)]
-    Deserialization(#[source] toml::de::Error),
-
-    #[error("Failed to serialize the data: {0}")]
-    #[from(toml::ser::Error)]
-    Serialization(#[source] toml::ser::Error),
-}
-
-#[derive(Default, Debug, Serialize, Deserialize)]
-pub(crate) struct Config {
-    pub(crate) file_paths: HashMap<PathBuf, (u8, u8)>,
-}
-
-impl Config {
-    fn new() -> Self {
-        Self::default()
+impl Configuration {
+    pub fn insert_row(&mut self, path: String, min_depth: usize, max_depth: usize) {
+        self.0.entry(path).or_insert(Flags {
+            min_depth,
+            max_depth,
+        });
     }
 
-    pub fn read(&mut self) -> Result<(), ConfErrs> {
-        let config_path = dirs::config_dir()
-            .ok_or(ConfErrs::ConfigDir)?
-            .join("tmux-fzy/config.toml");
+    pub fn save_configuration(&self) -> Result<(), Error> {
+        let config_dir =
+            get_config_dir().ok_or(anyhow::anyhow!("Failed to locate the config directory."))?;
+        let file_path = config_dir.join(".tmux-fzy");
 
-        if !config_path.exists() {
-            std::fs::create_dir_all(config_path.parent().unwrap()).map_err(ConfErrs::FileOpen)?;
-            let mut file = File::create(&config_path).map_err(ConfErrs::FileOpen)?;
-            let empty = Config::new();
-            let empty_to_string =
-                toml::to_string_pretty(&empty).map_err(ConfErrs::Serialization)?;
-            file.write_all(empty_to_string.as_bytes())
-                .map_err(ConfErrs::FileWrite)?;
-        }
-
-        let mut file = File::open(&config_path).map_err(ConfErrs::FileOpen)?;
-        let mut contents = String::new();
-        file.read_to_string(&mut contents).map_err(ConfErrs::Read)?;
-        let config: Config = toml::from_str(&contents).map_err(ConfErrs::Deserialization)?;
-        self.file_paths = config.file_paths;
-        Ok(())
-    }
-
-    pub(crate) fn write_single_path(&mut self, path: (PathBuf, (u8, u8))) -> Result<(), ConfErrs> {
-        let config_path = dirs::config_dir()
-            .ok_or(ConfErrs::ConfigDir)?
-            .join("tmux-fzy/config.toml");
-
-        let dir_path = path.0.canonicalize().map_err(ConfErrs::FileWrite)?;
-        if self.file_paths.get(&dir_path).is_none() {
-            self.file_paths.insert(dir_path, (path.1 .0, path.1 .1));
-        }
-
-        let mut file = OpenOptions::new()
-            .append(false)
-            .write(true)
-            .open(config_path)
-            .map_err(ConfErrs::FileOpen)?;
-
-        let content = toml::to_string_pretty(&self).map_err(ConfErrs::Serialization)?;
-        file.write_all(content.as_bytes())
-            .map_err(ConfErrs::FileWrite)?;
-        Ok(())
-    }
-
-    pub(crate) fn write_all(&mut self) -> Result<(), ConfErrs> {
-        let config_path = dirs::config_dir()
-            .ok_or(ConfErrs::ConfigDir)?
-            .join("tmux-fzy/config.toml");
+        let c = self.to_string();
 
         let mut file = OpenOptions::new()
             .append(false)
             .write(true)
             .truncate(true)
-            .open(config_path)
-            .map_err(ConfErrs::FileOpen)?;
+            .open(file_path)
+            .map_err(|e| Error::UnexpectedError(e.into()))?;
 
-        let content = toml::to_string_pretty(&self).map_err(ConfErrs::Serialization)?;
-        file.write_all(content.as_bytes())
-            .map_err(ConfErrs::FileWrite)?;
+        file.write_all(c.as_bytes())
+            .map_err(|e| Error::UnexpectedError(e.into()))?;
+
         Ok(())
     }
 
-    pub(crate) fn expand(&self) -> Vec<PathBuf> {
-        let mut directories = Vec::new();
-        for (paths, (min, max)) in &self.file_paths {
-            directories.extend(
-                WalkDir::new(paths)
-                    .min_depth(*min as usize)
-                    .max_depth(*max as usize)
-                    .into_iter()
-                    .filter_map(|entry| {
-                        let entry = entry.ok()?;
-                        let path = entry.path().to_owned();
-                        if entry.file_type().is_dir() {
-                            Some(path)
-                        } else {
-                            None
-                        }
-                    }),
-            );
+    pub fn expand_paths(&self) -> Vec<String> {
+        let mut dirs = Vec::new();
+        for (
+            path,
+            Flags {
+                min_depth,
+                max_depth,
+            },
+        ) in self.0.iter()
+        {
+            let directories = WalkDir::new(path)
+                .min_depth(*min_depth)
+                .max_depth(*max_depth)
+                .into_iter()
+                .filter_map(|entry| {
+                    let entry = entry.ok()?;
+                    let path = entry.path().to_owned();
+                    if entry.file_type().is_dir() {
+                        Some(path.to_str().unwrap().to_owned())
+                    } else {
+                        None
+                    }
+                });
+            dirs.extend(directories);
         }
-        directories
+        dirs
     }
+}
+
+impl FromStr for Configuration {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let mut map = HashMap::new();
+        for (i, line) in s.lines().enumerate() {
+            let values: Vec<&str> = line.split(":|:").collect();
+
+            if values.len() != 3 {
+                return Err("Invalid number of values".into());
+            }
+
+            let _ = PathBuf::from_str(values[1])
+                .map_err(|_| format!("Error on line {}, invalid path", i))?;
+            let min_depth: usize = values[1]
+                .parse()
+                .map_err(|_| format!("Error on line {}, invalid min_depth", i))?;
+            let max_depth: usize = values[2]
+                .parse()
+                .map_err(|_| format!("Error on line {}, invalid max_depth", i))?;
+            map.entry(values[0].to_string()).or_insert(Flags {
+                min_depth,
+                max_depth,
+            });
+        }
+        Ok(Configuration(map))
+    }
+}
+
+impl ToString for Configuration {
+    fn to_string(&self) -> String {
+        self.0
+            .iter()
+            .map(|(key, value)| format!("{}:|:{}:|:{}", key, value.min_depth, value.max_depth))
+            .collect::<Vec<String>>()
+            .join("\n")
+    }
+}
+
+pub fn is_absolute_path(path: OsString) -> Option<PathBuf> {
+    let path = PathBuf::from(path);
+    if path.is_absolute() {
+        Some(path)
+    } else {
+        None
+    }
+}
+
+pub fn get_config_dir() -> Option<PathBuf> {
+    env::var_os("XDG_CACHE_HOME")
+        .and_then(is_absolute_path)
+        .or_else(|| {
+            env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|h| h.join(".cache"))
+        })
+}
+
+pub fn init_config(path: &PathBuf) -> Result<(), anyhow::Error> {
+    let dir = path.parent().unwrap();
+    if !dir.exists() {
+        fs::create_dir(dir).map_err(|e| anyhow::anyhow!(e))?;
+    }
+    File::create(path).map_err(|e| anyhow::anyhow!(e))?;
+    Ok(())
+}
+
+pub fn get_configuration() -> Result<Configuration, Error> {
+    let config_dir =
+        get_config_dir().ok_or(anyhow::anyhow!("Failed to locate the config directory."))?;
+
+    let file_path = config_dir.join(".tmux-fzy");
+    if !file_path.exists() {
+        init_config(&file_path)?;
+    }
+
+    let mut file = File::open(&file_path).map_err(|e| Error::UnexpectedError(e.into()))?;
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)
+        .map_err(|e| Error::UnexpectedError(e.into()))?;
+    let config = Configuration::from_str(&contents).map_err(Error::ParseError)?;
+    Ok(config)
 }

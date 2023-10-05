@@ -1,14 +1,18 @@
-use crate::config;
-use crate::tui;
 use clap::{Parser, Subcommand};
-use crossterm::style;
-use crossterm::style::Stylize;
-use crossterm::QueueableCommand;
-use std::path::PathBuf;
+use crossterm::{
+    execute,
+    style::{Print, Stylize},
+};
+use std::{
+    io::{stderr, stdout},
+    path::PathBuf,
+};
+
+use crate::{config::Configuration, render, Error};
 
 #[derive(Parser)]
 #[command(name = "tmux-fzy")]
-pub(crate) struct Cli {
+pub struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -17,13 +21,12 @@ pub(crate) struct Cli {
 enum Commands {
     Add {
         #[arg(long, default_value_t = 0)]
-        maxdepth: u8,
-
+        maxdepth: usize,
         #[arg(long, default_value_t = 0)]
-        mindepth: u8,
-
+        mindepth: usize,
         paths: Vec<PathBuf>,
     },
+
     List,
 
     Del {
@@ -31,56 +34,71 @@ enum Commands {
     },
 }
 
-pub(crate) fn run() {
-    let mut config = config::load();
+pub fn start(config: &mut Configuration) -> Result<(), Error> {
     let cli = Cli::parse();
 
     match cli.command {
         None => {
-            tui::run(&mut config);
+            let res = render(config);
+            if let Err(err) = res {
+                execute!(
+                    stderr(),
+                    Print(crossterm::style::Stylize::bold(
+                        crossterm::style::Stylize::red("Error: ")
+                    )),
+                    Print(format!("{:?}", err))
+                )
+                .map_err(|e| Error::UnexpectedError(e.into()))?
+            }
+
+            Ok(())
         }
         Some(cmd) => match cmd {
             Commands::Add {
-                mindepth,
                 maxdepth,
+                mindepth,
                 paths,
             } => {
-                for i in paths {
-                    if i.is_dir() {
-                        if let Err(err) = config.write_single_path((i, (mindepth, maxdepth))) {
-                            eprintln!("{}", err);
-                        }
-                    } else {
-                        eprintln!("Invalid path: {:?}", i);
-                    }
+                for path in paths {
+                    let path = path
+                        .canonicalize()
+                        .map_err(|e| Error::UnexpectedError(e.into()))?
+                        .to_str()
+                        .unwrap()
+                        .to_string();
+
+                    config.insert_row(path, mindepth, maxdepth);
                 }
-            }
-            Commands::List => {
-                for (path, (min, max)) in config.file_paths {
-                    let stdout = || -> Result<(), std::io::Error> {
-                        std::io::stdout()
-                            .queue(style::PrintStyledContent("[min depth: ".green()))?
-                            .queue(style::PrintStyledContent(min.to_string().green()))?
-                            .queue(style::PrintStyledContent(", max depth: ".green()))?
-                            .queue(style::PrintStyledContent(max.to_string().green()))?
-                            .queue(style::PrintStyledContent("]".green()))?;
-
-                        Ok(())
-                    };
-
-                    stdout().expect("Failed to print list");
-
-                    print!(" => {}", path.to_str().unwrap());
-
-                    println!();
-                }
+                config.save_configuration().expect("Failed to save");
+                Ok(())
             }
             Commands::Del { paths } => {
                 for path in paths {
-                    let path = path.canonicalize().expect("Directory not found");
-                    config.file_paths.remove(&path);
-                    config.write_all().expect("Failed to Write to the file");
+                    let path = path
+                        .canonicalize()
+                        .map_err(|e| Error::UnexpectedError(e.into()))?;
+                    let path = path.to_str().unwrap();
+                    _ = config.0.remove(path);
+                    config.save_configuration()?;
                 }
+                Ok(())
+            }
+            Commands::List => {
+                for (i, (path, values)) in config.0.iter().enumerate() {
+                    execute!(
+                        stdout(),
+                        Print(format!("{}: ", i + 1).blue()),
+                        Print(path),
+                        Print("\tsearch_depth:[".blue()),
+                        Print("min:"),
+                        Print(values.min_depth),
+                        Print(", max:"),
+                        Print(values.max_depth),
+                        Print("]".blue()),
+                    )
+                    .map_err(|e| Error::UnexpectedError(e.into()))?;
+                }
+                Ok(())
             }
         },
     }

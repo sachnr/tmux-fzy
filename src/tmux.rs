@@ -1,144 +1,158 @@
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 
-pub(crate) fn run(path: PathBuf) -> Result<(), std::io::Error> {
-    let basename = path.file_name().unwrap().to_str().unwrap();
-    let tmux = Tmux::new(path.to_str().unwrap().to_string(), basename.to_string());
+use crate::Error;
 
-    match (tmux.is_running()?, tmux.env()) {
-        (false, false) => {
-            tmux.new_session()?;
-            Ok(())
-        }
-        (true, false) => {
-            if tmux.has_session()? {
-                tmux.attach()?;
-            } else {
-                tmux.new_session()?;
-            }
-            Ok(())
-        }
-        (true, true) => {
-            if tmux.has_session()? {
-                tmux.switch()?;
-            } else {
-                tmux.new_session_detach()?;
-                tmux.switch()?;
-            }
-            Ok(())
-        }
-        _ => unreachable!(),
-    }
+/// Check if tmux is running
+pub fn status() -> Result<bool, Error> {
+    let status = Command::new("pgrep")
+        .arg("tmux")
+        .output()
+        .map_err(|e| Error::UnexpectedError(e.into()))?
+        .status
+        .success();
+
+    Ok(status)
 }
 
-struct Tmux {
-    path: String,
-    basename: String,
+/// Check if the 'TMUX' env variable is set
+pub fn env() -> bool {
+    std::env::var("TMUX").is_ok()
 }
 
-pub(crate) fn kill_session(path: PathBuf) -> Result<(), std::io::Error> {
-    let basename = path.file_name().unwrap().to_str().unwrap();
-    Command::new("tmux")
-        .arg("kill-session")
-        .arg("-t")
-        .arg(basename)
-        .output()?;
+pub fn has_session(session_name: &str) -> Result<bool, Error> {
+    let status = CommandBuilder::new()
+        .args(vec!["has-session", "-t", session_name])
+        .run()?;
+
+    Ok(status)
+}
+
+pub fn kill_session(session_name: &str) -> Result<(), Error> {
+    CommandBuilder::new()
+        .args(vec!["kill-session", "-t", session_name])
+        .run()?;
 
     Ok(())
 }
 
-pub(crate) fn sessions() -> Vec<String> {
-    let output = Command::new("tmux")
-        .arg("ls")
-        .stdout(Stdio::piped())
-        .output()
-        .expect("Failed to run tmux ls");
+/// lists all active sessions
+pub fn list_sessions() -> Result<Vec<String>, Error> {
+    let output = CommandBuilder::new()
+        .args(vec!["ls", "-F", "'#{session_name}'"])
+        .run_capture_output()?;
 
-    let stdout = String::from_utf8(output.stdout)
-        .unwrap()
+    let sessions = output
         .lines()
         .map(|line| {
-            line.split_once(' ')
-                .unwrap()
-                .0
-                .strip_suffix(':')
-                .unwrap()
-                .to_string()
+            let session = line.trim();
+            let prefix = session.strip_prefix('\'').unwrap();
+            let suffix = prefix.strip_suffix('\'').unwrap();
+            suffix.to_string()
         })
         .collect::<Vec<String>>();
 
-    stdout
+    Ok(sessions)
 }
 
-impl Tmux {
-    fn new(path: String, basename: String) -> Self {
-        Self { path, basename }
+/// Detach from the current session and start a new session, useful when
+/// you are inside a tmux session
+pub fn switch_client(session_name: &str) -> Result<(), Error> {
+    CommandBuilder::new()
+        .args(vec!["switch-client", "-t", session_name])
+        .run_inherit_stdio()?;
+
+    Ok(())
+}
+
+/// attach to a new session, useful when you are outside a tmux session
+pub fn attach(session_name: &str) -> Result<(), Error> {
+    CommandBuilder::new()
+        .args(vec!["attach", "-t", session_name])
+        .run_inherit_stdio()?;
+
+    Ok(())
+}
+
+pub fn new_session(session_name: &str, path: &str) -> Result<(), Error> {
+    CommandBuilder::new()
+        .args(vec!["new-session", "-s", session_name, "-c", path])
+        .run_inherit_stdio()?;
+
+    Ok(())
+}
+
+/// don't attach new session to current terminal
+pub fn new_session_detach(session_name: &str, path: &str) -> Result<(), Error> {
+    CommandBuilder::new()
+        .args(vec!["new-session", "-ds", session_name, "-c", path])
+        .run_inherit_stdio()?;
+
+    Ok(())
+}
+
+/// Helper to run tmux commands
+///
+/// Example
+///
+/// ```no_run
+/// pub fn ls() -> Result<(), Error> {
+///     CommandBuilder::new()
+///         .args(vec!["ls"])
+///         .run()?;
+///     Ok(())
+/// }
+/// ```
+pub struct CommandBuilder<'a> {
+    args: Vec<&'a str>,
+}
+
+impl<'a> CommandBuilder<'a> {
+    pub fn new() -> CommandBuilder<'a> {
+        CommandBuilder { args: Vec::new() }
     }
 
-    fn env(&self) -> bool {
-        std::env::var("TMUX").is_ok()
+    pub fn arg(mut self, s: &'a str) -> Self {
+        self.args.push(s);
+        self
     }
 
-    fn is_running(&self) -> Result<bool, std::io::Error> {
-        let output = Command::new("pgrep")
-            .arg("tmux")
+    pub fn args(mut self, s: Vec<&'a str>) -> Self {
+        self.args.extend(s);
+        self
+    }
+
+    pub fn run(self) -> Result<bool, Error> {
+        let command = Command::new("tmux")
+            .args(self.args)
+            .output()
+            .map_err(|e| Error::UnexpectedError(e.into()))?
+            .status
+            .success();
+
+        Ok(command)
+    }
+
+    pub fn run_capture_output(self) -> Result<String, Error> {
+        let command = Command::new("tmux")
+            .args(self.args)
             .stdout(Stdio::piped())
-            .output()?;
+            .output()
+            .map_err(|e| Error::UnexpectedError(e.into()))?;
 
-        if output.status.success() {
-            Ok(!String::from_utf8_lossy(&output.stdout).is_empty())
-        } else {
-            Ok(false)
-        }
+        let stdout = String::from_utf8_lossy(&command.stdout);
+        let output = stdout.to_string();
+
+        Ok(output)
     }
 
-    fn has_session(&self) -> Result<bool, std::io::Error> {
-        let output = Command::new("tmux")
-            .arg("has-session")
-            .arg("-t")
-            .arg(&self.basename)
-            .output()?;
-
-        Ok(output.status.success())
-    }
-
-    fn new_session(&self) -> Result<(), std::io::Error> {
-        Command::new("tmux")
-            .args(["new-session", "-s", &self.basename, "-c", &self.path])
+    pub fn run_inherit_stdio(self) -> Result<Output, Error> {
+        let command = Command::new("tmux")
+            .args(self.args)
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
-            .output()?;
-        Ok(())
-    }
-
-    fn new_session_detach(&self) -> Result<(), std::io::Error> {
-        Command::new("tmux")
-            .args(["new-session", "-ds", &self.basename, "-c", &self.path])
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .output()?;
-        Ok(())
-    }
-
-    fn attach(&self) -> Result<(), std::io::Error> {
-        Command::new("tmux")
-            .args(["attach", "-t", &self.basename])
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .output()?;
-        Ok(())
-    }
-
-    fn switch(&self) -> Result<(), std::io::Error> {
-        Command::new("tmux")
-            .args(["switch-client", "-t", &self.basename])
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .output()?;
-        Ok(())
+            .output()
+            .map_err(|e| Error::UnexpectedError(e.into()))?;
+        Ok(command)
     }
 }
