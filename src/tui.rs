@@ -202,21 +202,23 @@ impl StatefullList {
     }
 
     fn update(&mut self, list: Vec<Item>) {
-        let len = list.len();
         match self.state.selected() {
             None => {
-                if len > 0 {
-                    self.items = list;
-                    self.state.select(Some(0));
-                }
-            }
-            Some(curr) => {
-                if len < curr {
+                if !list.is_empty() {
                     self.state.select(Some(0))
                 }
-                self.items = list;
+            }
+            Some(prev_i) => {
+                if list.is_empty() {
+                    self.state.select(None);
+                } else {
+                    if list.len() <= prev_i {
+                        self.state.select(Some(0))
+                    }
+                }
             }
         }
+        self.items = list;
     }
 }
 
