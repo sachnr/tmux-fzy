@@ -272,8 +272,10 @@ fn run_app<B: Backend>(
     tick_rate: Duration,
 ) -> Result<(), Error> {
     let mut last_tick = Instant::now();
-    if !app.tabs[app.curr_tab].list.items.is_empty() {
-        app.tabs[app.curr_tab].list.state.select(Some(0));
+    for tab in app.tabs.iter_mut() {
+        if !tab.list.items.is_empty() {
+            tab.list.state.select(Some(0))
+        }
     }
     loop {
         terminal
@@ -347,7 +349,6 @@ fn run_app<B: Backend>(
                                 app.curr_tab = 0;
                                 app.message = HINT1.to_owned();
                             }
-                            app.tabs[app.curr_tab].update();
                         }
                         _ => {}
                     },
