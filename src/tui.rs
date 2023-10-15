@@ -59,6 +59,8 @@ struct App<'a> {
     tabs: [Tab<'a>; 2],
     input_mode: InputMode,
     message: Line<'a>,
+    user_input: String,
+    cursor_position: usize,
 }
 
 impl<'a> App<'a> {
@@ -69,6 +71,8 @@ impl<'a> App<'a> {
             tabs,
             input_mode: InputMode::Editing,
             message: HINT1.to_owned(),
+            user_input: String::new(),
+            cursor_position: 0,
         }
     }
 
@@ -76,14 +80,41 @@ impl<'a> App<'a> {
         let selected = self.tabs[self.curr_tab].list.state.selected();
         selected.map(|selected| self.tabs[self.curr_tab].list.items[selected].path.clone())
     }
+
+    fn enter_char(&mut self, c: char) {
+        self.user_input.push(c);
+        self.cursor_position += 1;
+        self.fzy_matcher_update_lists();
+    }
+
+    fn del_char(&mut self) {
+        if self.user_input.pop().is_some() {
+            self.cursor_position -= 1;
+            self.fzy_matcher_update_lists();
+        };
+    }
+
+    fn fzy_matcher_update_lists(&mut self) {
+        let matcher = fuzzy_matcher::skim::SkimMatcherV2::default();
+        for tab in self.tabs.iter_mut() {
+            let mut items = Vec::new();
+            for s in tab.orignal_list.iter() {
+                if let Some((_, indices)) = matcher.fuzzy_indices(s.as_str(), &self.user_input) {
+                    items.push(Item {
+                        path: s.clone(),
+                        indices,
+                    })
+                }
+            }
+            tab.list.update(items);
+        }
+    }
 }
 
 struct Tab<'a> {
     name: &'a str,
-    user_input: String,
     list: StatefullList,
     orignal_list: Vec<String>,
-    cursor_position: usize,
 }
 
 impl<'a> Tab<'a> {
@@ -91,43 +122,9 @@ impl<'a> Tab<'a> {
         let items: Vec<Item> = paths.iter().map(|s| Item::make_item(s.clone())).collect();
         Self {
             name,
-            user_input: String::new(),
             list: StatefullList::with_items(items),
             orignal_list: paths,
-            cursor_position: 0,
         }
-    }
-
-    fn update(&mut self) {
-        let items = self.fuzzy_matcher();
-        self.list.update(items);
-    }
-
-    fn enter_char(&mut self, c: char) {
-        self.user_input.push(c);
-        self.cursor_position += 1;
-        self.update();
-    }
-
-    fn del_char(&mut self) {
-        if self.user_input.pop().is_some() {
-            self.cursor_position -= 1;
-            self.update();
-        };
-    }
-
-    fn fuzzy_matcher(&mut self) -> Vec<Item> {
-        let matcher = fuzzy_matcher::skim::SkimMatcherV2::default();
-        let mut items = Vec::new();
-        for s in self.orignal_list.iter() {
-            if let Some((_, indices)) = matcher.fuzzy_indices(s.as_str(), &self.user_input) {
-                items.push(Item {
-                    path: s.clone(),
-                    indices,
-                })
-            }
-        }
-        items
     }
 }
 
@@ -211,10 +208,8 @@ impl StatefullList {
             Some(prev_i) => {
                 if list.is_empty() {
                     self.state.select(None);
-                } else {
-                    if list.len() <= prev_i {
-                        self.state.select(Some(0))
-                    }
+                } else if list.len() <= prev_i {
+                    self.state.select(Some(0))
                 }
             }
         }
@@ -314,15 +309,11 @@ fn run_app<B: Backend>(
                         | (KeyCode::Up, KeyModifiers::CONTROL) => {
                             app.tabs[app.curr_tab].list.scroll_up()
                         }
-                        (KeyCode::Char(c), KeyModifiers::NONE) => {
-                            app.tabs[app.curr_tab].enter_char(c)
-                        }
+                        (KeyCode::Char(c), KeyModifiers::NONE) => app.enter_char(c),
                         (KeyCode::Char(c), KeyModifiers::SHIFT) => {
-                            app.tabs[app.curr_tab].enter_char(c.to_ascii_uppercase())
+                            app.enter_char(c.to_ascii_uppercase())
                         }
-                        (KeyCode::Backspace, KeyModifiers::NONE) => {
-                            app.tabs[app.curr_tab].del_char()
-                        }
+                        (KeyCode::Backspace, KeyModifiers::NONE) => app.del_char(),
                         (KeyCode::Enter, KeyModifiers::NONE) => {
                             if let Some(path) = app.get_selected() {
                                 if app.curr_tab == 0 {
@@ -359,7 +350,7 @@ fn run_app<B: Backend>(
                             if let Some(session) = app.get_selected() {
                                 tmux::kill_session(&session)?;
                                 app.tabs[app.curr_tab].orignal_list = tmux::list_sessions()?;
-                                app.tabs[app.curr_tab].update();
+                                app.fzy_matcher_update_lists();
                                 if let Some(selected) = app.tabs[app.curr_tab].list.state.selected()
                                 {
                                     let len = app.tabs[app.curr_tab].list.items.len();
@@ -420,7 +411,7 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
     f.render_widget(input, chunks[1]);
     if let InputMode::Editing = app.input_mode {
         f.set_cursor(
-            chunks[1].x + app.tabs[app.curr_tab].cursor_position as u16 + 1,
+            chunks[1].x + app.cursor_position as u16 + 1,
             // Move one line down, from the border to the input line
             chunks[1].y + 1,
         );
@@ -462,7 +453,7 @@ fn get_tabs<'a>(app: &'a App) -> Tabs<'a> {
 }
 
 fn get_inputs<'a>(app: &'a App) -> Paragraph<'a> {
-    Paragraph::new(app.tabs[app.curr_tab].user_input.as_str())
+    Paragraph::new(app.user_input.as_str())
         .style(Style::default().fg(Color::White))
         .block(
             Block::default()
@@ -508,7 +499,7 @@ fn get_items<'a>(app: &App) -> List<'a> {
     List::new(items)
         .block(
             Block::default()
-                .padding(Padding::new(1, 5, 0, 2))
+                .padding(Padding::new(1, 5, 0, 0))
                 .title("Results")
                 .borders(Borders::LEFT)
                 .style(Style::default().fg(Color::Blue)),

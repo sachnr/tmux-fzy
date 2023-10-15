@@ -95,6 +95,7 @@ pub fn start(config: &mut Configuration) -> Result<(), Error> {
                         Print(", max:"),
                         Print(values.max_depth),
                         Print("]".blue()),
+                        Print("\n"),
                     )
                     .map_err(|e| Error::UnexpectedError(e.into()))?;
                 }
