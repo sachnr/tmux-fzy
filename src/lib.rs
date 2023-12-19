@@ -7,8 +7,8 @@ mod tui;
 use std::path::PathBuf;
 
 pub use cli::start;
-pub use config::get_configuration;
-pub use tui::render;
+pub use config::{get_paths, AppColors, Paths};
+pub use tui::*;
 
 #[derive(thiserror::Error)]
 pub enum Error {

@@ -21,31 +21,40 @@ use ratatui::{
     Frame, Terminal,
 };
 
-use crate::{config::Configuration, start_tmux, switch_sessions, tmux, Error};
+use crate::{start_tmux, switch_sessions, tmux, AppColors, Error, Paths};
 
 static HINT1: Lazy<Line<'static>> = Lazy::new(|| {
     Line::from(vec![
-        Span::styled("Movement: ", Style::default().fg(Color::Blue)),
-        Span::styled("<C-j>, <C-k>, Up, Down", Style::default().fg(Color::White)),
-        Span::styled(" | ", Style::default().fg(Color::White)),
-        Span::styled("Tabs: ", Style::default().fg(Color::Blue)),
-        Span::styled("<Tab>, Right, Left", Style::default().fg(Color::White)),
-        Span::styled(" | ", Style::default().fg(Color::White)),
-        Span::styled("Scroll: ", Style::default().fg(Color::Blue)),
+        Span::styled("Movement: ", Style::default().fg(AppColors::Fg.get())),
+        Span::styled(
+            "<C-j>, <C-k>, Up, Down",
+            Style::default().fg(AppColors::Fg.get()),
+        ),
+        Span::styled(" | ", Style::default().fg(AppColors::Fg.get())),
+        Span::styled("Tabs: ", Style::default().fg(AppColors::Active.get())),
+        Span::styled(
+            "<Tab>, Right, Left",
+            Style::default().fg(AppColors::Fg.get()),
+        ),
+        Span::styled(" | ", Style::default().fg(AppColors::Fg.get())),
+        Span::styled("Scroll: ", Style::default().fg(AppColors::Active.get())),
         Span::styled(
             "<C-u>, <C-d>, <C-up>, <C-down>",
-            Style::default().fg(Color::White),
+            Style::default().fg(AppColors::Fg.get()),
         ),
-        Span::styled(" | ", Style::default().fg(Color::White)),
-        Span::styled("Exit: ", Style::default().fg(Color::Blue)),
-        Span::styled("<C-c>, <Esc>", Style::default().fg(Color::White)),
+        Span::styled(" | ", Style::default().fg(AppColors::Fg.get())),
+        Span::styled("Exit: ", Style::default().fg(AppColors::Active.get())),
+        Span::styled("<C-c>, <Esc>", Style::default().fg(AppColors::Fg.get())),
     ])
 });
 
 static HINT2: Lazy<Line<'static>> = Lazy::new(|| {
     Line::from(vec![
-        Span::styled("Kill Session: ", Style::default().fg(Color::Blue)),
-        Span::styled("<C-x>, <Delete>", Style::default().fg(Color::White)),
+        Span::styled(
+            "Kill Session: ",
+            Style::default().fg(AppColors::Active.get()),
+        ),
+        Span::styled("<C-x>, <Delete>", Style::default().fg(AppColors::Fg.get())),
     ])
 });
 
@@ -220,7 +229,7 @@ impl StatefullList {
 // type Result<T> = std::result::Result<T, Box<dyn Error>>;
 type TuiError<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-pub fn render(config: &Configuration) -> TuiError<()> {
+pub fn render(config: &Paths) -> TuiError<()> {
     Lazy::force(&HINT1);
     Lazy::force(&HINT2);
     let original_hook = std::panic::take_hook();
@@ -424,12 +433,12 @@ fn get_message<'a>(app: &'a App) -> Paragraph<'a> {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Blue))
+                .border_style(Style::default().fg(AppColors::Border.get()))
                 .padding(Padding::new(2, 0, 0, 0))
                 .title("Info")
-                .title_style(Style::default().fg(Color::Blue)),
+                .title_style(Style::default().fg(AppColors::Border.get())),
         )
-        .style(Style::default().fg(Color::White))
+        .style(Style::default().fg(AppColors::Fg.get()))
 }
 
 fn get_tabs<'a>(app: &'a App) -> Tabs<'a> {
@@ -439,26 +448,27 @@ fn get_tabs<'a>(app: &'a App) -> Tabs<'a> {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Blue))
-                .title_style(Style::default().fg(Color::Blue))
+                .border_style(Style::default().fg(AppColors::Border.get()))
+                .title_style(Style::default().fg(AppColors::Border.get()))
                 .title("Sessions"),
         )
         .select(app.curr_tab)
-        .style(Style::default().fg(Color::Gray))
+        .style(Style::default().fg(AppColors::Inactive.get()))
         .highlight_style(
             Style::default()
                 .add_modifier(Modifier::BOLD)
-                .fg(Color::Blue),
+                .fg(AppColors::Active.get()),
         )
 }
 
 fn get_inputs<'a>(app: &'a App) -> Paragraph<'a> {
     Paragraph::new(app.user_input.as_str())
-        .style(Style::default().fg(Color::White))
+        .style(Style::default().fg(AppColors::Fg.get()))
         .block(
             Block::default()
-                .style(Style::default().fg(Color::LightRed))
+                .style(Style::default().fg(AppColors::Active.get()))
                 .borders(Borders::BOTTOM)
+                .border_style(Style::default().fg(AppColors::Border.get()))
                 .title(" Input")
                 .padding(Padding::new(1, 0, 0, 0)),
         )
@@ -480,10 +490,12 @@ fn get_items<'a>(app: &App) -> List<'a> {
                             let contains = indices.contains(&char_index);
                             let focused = line_index == selected;
                             match (focused, contains) {
-                                (true, true) => (Color::Yellow, Color::Blue),
-                                (true, false) => (Color::Black, Color::Blue),
-                                (false, true) => (Color::Yellow, Color::default()),
-                                (false, false) => (Color::White, Color::default()),
+                                (true, true) => {
+                                    (AppColors::Selection.get(), AppColors::Active.get())
+                                }
+                                (true, false) => (Color::Black, AppColors::Active.get()),
+                                (false, true) => (AppColors::Selection.get(), Color::default()),
+                                (false, false) => (AppColors::Fg.get(), Color::default()),
                             }
                         };
                         Span::styled(char.to_string(), Style::default().fg(fg).bg(bg))
@@ -502,7 +514,8 @@ fn get_items<'a>(app: &App) -> List<'a> {
                 .padding(Padding::new(1, 5, 0, 0))
                 .title("Results")
                 .borders(Borders::LEFT)
-                .style(Style::default().fg(Color::Blue)),
+                .border_style(Style::default().fg(AppColors::Border.get()))
+                .style(Style::default().fg(AppColors::Active.get())),
         )
         .start_corner(Corner::TopLeft)
 }

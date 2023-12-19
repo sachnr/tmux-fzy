@@ -8,7 +8,7 @@ use std::{
     path::PathBuf,
 };
 
-use crate::{config::Configuration, render, Error};
+use crate::{config::Paths, render, Error};
 
 #[derive(Parser)]
 #[command(name = "tmux-fzy")]
@@ -34,7 +34,7 @@ enum Commands {
     },
 }
 
-pub fn start(config: &mut Configuration) -> Result<(), Error> {
+pub fn start(config: &mut Paths) -> Result<(), Error> {
     let cli = Cli::parse();
 
     match cli.command {

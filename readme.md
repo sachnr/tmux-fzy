@@ -27,4 +27,16 @@ how to add dirs
 tmux-fzy add --mindepth 1 --maxdepth 1 ~/Music
 ```
 
-_dirs are stored in `XDG_CACHE_HOME/.tmux-fzy`_
+### color cutomization _(optional)_
+
+add ansi color codes 0-15 in `~/.config/tmux-fzy/config`
+
+```
+fg=15
+border=15
+inactive=8
+active=1
+selection=2
+```
+
+_paths are stored in `XDG_CACHE_HOME/.tmux-fzy`_
