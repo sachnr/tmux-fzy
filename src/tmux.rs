@@ -1,13 +1,14 @@
-use std::process::{Command, Output, Stdio};
+#![allow(dead_code)]
 
-use crate::Error;
+use anyhow::Error;
+use std::process::{Command, Output, Stdio};
 
 /// Check if tmux is running
 pub fn status() -> Result<bool, Error> {
     let status = Command::new("pgrep")
         .arg("tmux")
         .output()
-        .map_err(|e| Error::UnexpectedError(e.into()))?
+        .map_err(|e| anyhow::anyhow!(e))?
         .status
         .success();
 
@@ -90,18 +91,6 @@ pub fn new_session_detach(session_name: &str, path: &str) -> Result<(), Error> {
     Ok(())
 }
 
-/// Helper to run tmux commands
-///
-/// Example
-///
-/// ```no_run
-/// pub fn ls() -> Result<(), Error> {
-///     CommandBuilder::new()
-///         .args(vec!["ls"])
-///         .run()?;
-///     Ok(())
-/// }
-/// ```
 pub struct CommandBuilder<'a> {
     args: Vec<&'a str>,
 }
@@ -125,7 +114,7 @@ impl<'a> CommandBuilder<'a> {
         let command = Command::new("tmux")
             .args(self.args)
             .output()
-            .map_err(|e| Error::UnexpectedError(e.into()))?
+            .map_err(|err| anyhow::anyhow!(err))?
             .status
             .success();
 
@@ -137,7 +126,7 @@ impl<'a> CommandBuilder<'a> {
             .args(self.args)
             .stdout(Stdio::piped())
             .output()
-            .map_err(|e| Error::UnexpectedError(e.into()))?;
+            .map_err(|err| anyhow::anyhow!(err))?;
 
         let stdout = String::from_utf8_lossy(&command.stdout);
         let output = stdout.to_string();
@@ -152,7 +141,7 @@ impl<'a> CommandBuilder<'a> {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .output()
-            .map_err(|e| Error::UnexpectedError(e.into()))?;
+            .map_err(|err| anyhow::anyhow!(err))?;
         Ok(command)
     }
 }

@@ -1,521 +1,346 @@
-use std::{
-    io::{self, stderr, stdout},
-    time::{Duration, Instant},
-};
+use std::{collections::BinaryHeap, path::PathBuf, time::Duration};
 
 use crossterm::{
-    event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
-    },
+    event::{KeyCode, KeyEvent, KeyModifiers},
     execute,
-    style::{Print, Stylize},
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use fuzzy_matcher::FuzzyMatcher;
-use once_cell::sync::Lazy;
+use jwalk::{
+    rayon::iter::{IntoParallelRefIterator, ParallelBridge, ParallelIterator},
+    WalkDir,
+};
 use ratatui::{
-    prelude::{Backend, Constraint, Corner, CrosstermBackend, Direction, Layout},
-    style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Padding, Paragraph, Tabs},
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout},
+    widgets::ListState,
     Frame, Terminal,
 };
 
-use crate::{start_tmux, switch_sessions, tmux, AppColors, Error, Paths};
+use crate::{
+    config::{Colors, PathList},
+    tmux,
+    tui_components::{get_input_bar, get_list, get_total_item_no},
+};
 
-static HINT1: Lazy<Line<'static>> = Lazy::new(|| {
-    Line::from(vec![
-        Span::styled("Movement: ", Style::default().fg(AppColors::Fg.get())),
-        Span::styled(
-            "<C-j>, <C-k>, Up, Down",
-            Style::default().fg(AppColors::Fg.get()),
-        ),
-        Span::styled(" | ", Style::default().fg(AppColors::Fg.get())),
-        Span::styled("Tabs: ", Style::default().fg(AppColors::Active.get())),
-        Span::styled(
-            "<Tab>, Right, Left",
-            Style::default().fg(AppColors::Fg.get()),
-        ),
-        Span::styled(" | ", Style::default().fg(AppColors::Fg.get())),
-        Span::styled("Scroll: ", Style::default().fg(AppColors::Active.get())),
-        Span::styled(
-            "<C-u>, <C-d>, <C-up>, <C-down>",
-            Style::default().fg(AppColors::Fg.get()),
-        ),
-        Span::styled(" | ", Style::default().fg(AppColors::Fg.get())),
-        Span::styled("Exit: ", Style::default().fg(AppColors::Active.get())),
-        Span::styled("<C-c>, <Esc>", Style::default().fg(AppColors::Fg.get())),
-    ])
-});
+pub struct PathItem<'a> {
+    pub path: &'a str,
+    pub fullpath: &'a str,
+    pub score: i64,
+    pub indices: Vec<usize>,
+}
 
-static HINT2: Lazy<Line<'static>> = Lazy::new(|| {
-    Line::from(vec![
-        Span::styled(
-            "Kill Session: ",
-            Style::default().fg(AppColors::Active.get()),
-        ),
-        Span::styled("<C-x>, <Delete>", Style::default().fg(AppColors::Fg.get())),
-    ])
-});
-
-enum InputMode {
-    Editing,
-    Command,
+#[derive(Default)]
+struct StatefulList<'a> {
+    state: ListState,
+    items: BinaryHeap<PathItem<'a>>,
+    history: Vec<BinaryHeap<PathItem<'a>>>,
 }
 
 struct App<'a> {
-    curr_tab: usize,
-    tabs: [Tab<'a>; 2],
-    input_mode: InputMode,
-    message: Line<'a>,
-    user_input: String,
-    cursor_position: usize,
+    running: bool,
+    input: String,
+    cursor_pos: usize,
+    total_items: usize,
+    colors: Colors,
+    list: StatefulList<'a>,
+}
+
+type Term = Terminal<CrosstermBackend<std::io::Stdout>>;
+
+pub fn start_tui(paths: PathList, colors: Colors) -> Result<(), anyhow::Error> {
+    let mut terminal = init_terminal()?;
+    let paths = expand_paths(paths);
+    let statefullist = StatefulList::from(&paths);
+    let mut app = App::new(statefullist, colors, paths.len());
+
+    while app.running {
+        let timeout = Duration::from_millis(200);
+        if crossterm::event::poll(timeout)? {
+            match crossterm::event::read()? {
+                crossterm::event::Event::Key(KeyEvent {
+                    code, modifiers, ..
+                }) => match (code, modifiers) {
+                    (KeyCode::Char(c), KeyModifiers::NONE) => {
+                        app.input.push(c);
+                        app.cursor_pos += 1;
+                        app.refresh();
+                    }
+                    (KeyCode::Char(c), KeyModifiers::SHIFT) => {
+                        app.input.push(c.to_ascii_uppercase());
+                        app.cursor_pos += 1;
+                        app.refresh();
+                    }
+                    (KeyCode::Backspace, KeyModifiers::NONE) => {
+                        _ = app.input.pop();
+                        app.cursor_pos = app.cursor_pos.saturating_sub(1);
+                        app.undo();
+                    }
+                    (KeyCode::Esc, KeyModifiers::NONE) => app.running = false,
+                    (KeyCode::Char('c'), KeyModifiers::CONTROL) => app.running = false,
+
+                    (KeyCode::Char('j'), KeyModifiers::CONTROL)
+                    | (KeyCode::Down, KeyModifiers::NONE) => app.list.next(),
+
+                    (KeyCode::Char('k'), KeyModifiers::CONTROL)
+                    | (KeyCode::Up, KeyModifiers::NONE) => app.list.prev(),
+
+                    (KeyCode::Char('d'), KeyModifiers::CONTROL)
+                    | (KeyCode::Down, KeyModifiers::CONTROL) => app.list.scroll_next(),
+
+                    (KeyCode::Char('u'), KeyModifiers::CONTROL)
+                    | (KeyCode::Up, KeyModifiers::CONTROL) => app.list.scroll_prev(),
+
+                    (KeyCode::Enter, KeyModifiers::NONE) => {
+                        if let Some(i) = app.list.state.selected() {
+                            if let Some(item) = app.list.items.iter().nth(i) {
+                                app.running = false;
+                                start_tmux(item.fullpath)?;
+                            } else {
+                                return Err(anyhow::anyhow!("Indexing Failed"));
+                            }
+                        }
+                    }
+
+                    _ => {}
+                },
+                crossterm::event::Event::Resize(_, _) => terminal.autoresize()?,
+                _ => {}
+            }
+        }
+        terminal.draw(|f| render_frame(f, &mut app))?;
+    }
+
+    Ok(())
+}
+
+fn render_frame(f: &mut Frame<'_>, app: &mut App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(1)
+        .constraints([Constraint::Min(2), Constraint::Percentage(100)].as_ref())
+        .split(f.size());
+
+    let top = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Min(1)].as_ref())
+        .split(chunks[0]);
+
+    let rows = chunks[1].height;
+    let curr_row = app.list.state.selected();
+
+    let input_bar = get_input_bar(&app.input, &app.colors);
+    let items = get_list(&app.list.items, rows, curr_row, &app.colors);
+    let status = get_total_item_no(app.total_items, items.len(), &app.colors);
+
+    f.render_widget(input_bar, top[0]);
+    f.render_widget(status, top[1]);
+    f.render_stateful_widget(items, chunks[1], &mut app.list.state);
+
+    f.set_cursor(top[0].x + app.cursor_pos as u16 + 3, top[0].y);
+}
+
+fn expand_paths(paths: PathList) -> Vec<(String, String)> {
+    let mut path_items = Vec::new();
+    for path in paths.entries {
+        let dirs: Vec<(String, String)> = WalkDir::new(path.path)
+            .min_depth(path.min_depth)
+            .max_depth(path.max_depth)
+            .into_iter()
+            .par_bridge()
+            .filter_map(|item| {
+                let entry = item.ok()?;
+                let path = entry.path().to_owned();
+                if entry.file_type().is_dir() {
+                    let full_path = path.to_str()?.to_string();
+                    let dir_name = path.file_name()?.to_str()?.to_string();
+                    Some((full_path, dir_name))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        path_items.extend(dirs);
+    }
+    path_items
+}
+
+fn init_terminal() -> Result<Term, anyhow::Error> {
+    enable_raw_mode()?;
+    let mut stdout = std::io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let terminal = Terminal::new(backend)?;
+    Ok(terminal)
+}
+
+pub fn reset_terminal() -> Result<(), anyhow::Error> {
+    disable_raw_mode()?;
+    execute!(std::io::stdout(), LeaveAlternateScreen)?;
+    Ok(())
+}
+
+impl<'a> From<&'a Vec<(String, String)>> for StatefulList<'a> {
+    fn from(value: &'a Vec<(String, String)>) -> Self {
+        let mut list = StatefulList::default();
+        for item in value {
+            list.items.push(PathItem {
+                path: &item.1,
+                fullpath: &item.0,
+                score: 0,
+                indices: vec![],
+            });
+        }
+        if !list.items.is_empty() {
+            list.state.select(Some(0))
+        }
+        list
+    }
+}
+
+impl<'a> Eq for PathItem<'a> {}
+impl<'a> PartialEq for PathItem<'a> {
+    fn eq(&self, other: &Self) -> bool {
+        self.score.eq(&other.score)
+    }
+}
+
+impl<'a> Ord for PathItem<'a> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.score.cmp(&other.score)
+    }
+}
+impl<'a> PartialOrd for PathItem<'a> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.score.cmp(&other.score))
+    }
 }
 
 impl<'a> App<'a> {
-    fn new(paths: Vec<String>, active_sessions: Vec<String>) -> Self {
-        let tabs = [Tab::new("All", paths), Tab::new("Active", active_sessions)];
-        Self {
-            curr_tab: 0,
-            tabs,
-            input_mode: InputMode::Editing,
-            message: HINT1.to_owned(),
-            user_input: String::new(),
-            cursor_position: 0,
+    fn new(list: StatefulList<'a>, colors: Colors, len: usize) -> Self {
+        App {
+            running: true,
+            input: String::new(),
+            cursor_pos: 0,
+            total_items: len,
+            list,
+            colors,
         }
     }
 
-    fn get_selected(&self) -> Option<String> {
-        let selected = self.tabs[self.curr_tab].list.state.selected();
-        selected.map(|selected| self.tabs[self.curr_tab].list.items[selected].path.clone())
-    }
-
-    fn enter_char(&mut self, c: char) {
-        self.user_input.push(c);
-        self.cursor_position += 1;
-        self.fzy_matcher_update_lists();
-    }
-
-    fn del_char(&mut self) {
-        if self.user_input.pop().is_some() {
-            self.cursor_position -= 1;
-            self.fzy_matcher_update_lists();
-        };
-    }
-
-    fn fzy_matcher_update_lists(&mut self) {
+    fn refresh(&mut self) {
         let matcher = fuzzy_matcher::skim::SkimMatcherV2::default();
-        for tab in self.tabs.iter_mut() {
-            let mut items = Vec::new();
-            for s in tab.orignal_list.iter() {
-                if let Some((_, indices)) = matcher.fuzzy_indices(s.as_str(), &self.user_input) {
-                    items.push(Item {
-                        path: s.clone(),
+
+        let new_items: BinaryHeap<PathItem> = self
+            .list
+            .items
+            .par_iter()
+            .filter_map(|item| {
+                if let Some((score, indices)) = matcher.fuzzy_indices(item.path, &self.input) {
+                    return Some(PathItem {
+                        path: item.path,
+                        fullpath: item.fullpath,
+                        score,
                         indices,
-                    })
+                    });
                 }
+                None
+            })
+            .collect();
+
+        let items = std::mem::take(&mut self.list.items);
+        self.list.history.push(items);
+        self.list.items = new_items;
+
+        let len = self.list.items.len();
+        match len {
+            0 => self.list.state.select(None),
+            i if i >= len => self.list.state.select(Some(0)),
+            _ => {}
+        }
+    }
+
+    fn undo(&mut self) {
+        if let Some(items) = self.list.history.pop() {
+            let len = items.len();
+            if len != 0 {
+                self.list.state.select(Some(0))
             }
-            tab.list.update(items);
+            self.list.items = items;
         }
     }
 }
 
-struct Tab<'a> {
-    name: &'a str,
-    list: StatefullList,
-    orignal_list: Vec<String>,
-}
-
-impl<'a> Tab<'a> {
-    fn new(name: &'a str, paths: Vec<String>) -> Tab<'a> {
-        let items: Vec<Item> = paths.iter().map(|s| Item::make_item(s.clone())).collect();
-        Self {
-            name,
-            list: StatefullList::with_items(items),
-            orignal_list: paths,
-        }
-    }
-}
-
-struct StatefullList {
-    items: Vec<Item>,
-    state: ListState,
-}
-
-struct Item {
-    path: String,
-    indices: Vec<usize>,
-}
-
-impl Item {
-    fn make_item(path: String) -> Self {
-        Self {
-            path,
-            indices: Vec::new(),
-        }
-    }
-}
-
-impl StatefullList {
-    fn with_items(items: Vec<Item>) -> StatefullList {
-        StatefullList {
-            items,
-            state: ListState::default(),
-        }
-    }
-
+impl<'a> StatefulList<'a> {
     fn next(&mut self) {
-        let len = self.items.len();
-        let selected = self.state.selected();
-        if let Some(selected) = selected {
-            if selected < len.saturating_sub(1) {
-                self.state.select(Some(selected + 1))
+        if let Some(i) = self.state.selected() {
+            if i < self.items.len() - 1 {
+                self.state.select(Some(i + 1));
             }
         }
     }
 
-    fn previous(&mut self) {
-        let selected = self.state.selected();
-        if let Some(selected) = selected {
-            if selected > 0 {
-                self.state.select(Some(selected.saturating_sub(1)))
+    fn scroll_next(&mut self) {
+        if let Some(i) = self.state.selected() {
+            if i < self.items.len() - 5 {
+                self.state.select(Some(i + 5));
+            } else {
+                self.state.select(Some(self.items.len() - 1))
             }
         }
     }
 
-    fn scroll_up(&mut self) {
-        let selected = self.state.selected();
-        if let Some(selected) = selected {
-            if selected > 5 {
-                self.state.select(Some(selected - 5))
+    fn prev(&mut self) {
+        if let Some(i) = self.state.selected() {
+            if i != 0 {
+                self.state.select(Some(i - 1));
+            }
+        }
+    }
+
+    fn scroll_prev(&mut self) {
+        if let Some(i) = self.state.selected() {
+            if i > 5 {
+                self.state.select(Some(i - 5));
             } else {
                 self.state.select(Some(0))
             }
         }
     }
-
-    fn scroll_down(&mut self) {
-        let len = self.items.len();
-        let selected = self.state.selected();
-        if let Some(selected) = selected {
-            let new_selected = selected + 5;
-            if new_selected >= len {
-                self.state.select(Some(len.saturating_sub(1)))
-            } else {
-                self.state.select(Some(new_selected))
-            }
-        }
-    }
-
-    fn update(&mut self, list: Vec<Item>) {
-        match self.state.selected() {
-            None => {
-                if !list.is_empty() {
-                    self.state.select(Some(0))
-                }
-            }
-            Some(prev_i) => {
-                if list.is_empty() {
-                    self.state.select(None);
-                } else if list.len() <= prev_i {
-                    self.state.select(Some(0))
-                }
-            }
-        }
-        self.items = list;
-    }
 }
 
-// type Result<T> = std::result::Result<T, Box<dyn Error>>;
-type TuiError<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+pub fn start_tmux(path: &str) -> Result<(), anyhow::Error> {
+    let pathbuf = PathBuf::from(path);
+    let session_name = pathbuf
+        .file_name()
+        .ok_or(anyhow::anyhow!("Failed to get session_name from filepath."))?
+        .to_str()
+        .ok_or(anyhow::anyhow!("session_name is not a valid utf8 string"))?;
 
-pub fn render(config: &Paths) -> TuiError<()> {
-    Lazy::force(&HINT1);
-    Lazy::force(&HINT2);
-    let original_hook = std::panic::take_hook();
+    let tmux_running = tmux::status()?;
+    let tmux_env = tmux::env();
+    let tmux_has_session = tmux::has_session(session_name)?;
 
-    std::panic::set_hook(Box::new(move |panic| {
-        reset_terminal().unwrap();
-        original_hook(panic);
-    }));
-
-    enable_raw_mode().map_err(|e| Error::UnexpectedError(e.into()))?;
-    let mut stdout = stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
-        .map_err(|e| Error::UnexpectedError(e.into()))?;
-
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend).map_err(|e| Error::UnexpectedError(e.into()))?;
-
-    let tick_rate = Duration::from_millis(250);
-    let paths = config.expand_paths();
-    let active_sessions = tmux::list_sessions()?;
-    let app = App::new(paths, active_sessions);
-    let res = run_app(&mut terminal, app, tick_rate);
-
-    reset_terminal()?;
-
-    if let Err(err) = res {
-        execute!(
-            stderr(),
-            Print("Error: ".red().bold()),
-            Print(format!("{:?}", err))
-        )?;
+    match (tmux_running, tmux_env) {
+        (false, false) => tmux::new_session(session_name, path)?,
+        (true, false) => {
+            if tmux_has_session {
+                tmux::attach(session_name)?;
+            } else {
+                tmux::new_session(session_name, path)?;
+            }
+        }
+        (true, true) => {
+            if tmux_has_session {
+                tmux::switch_client(session_name)?;
+            } else {
+                tmux::new_session_detach(session_name, path)?;
+                tmux::switch_client(session_name)?;
+            }
+        }
+        (false, true) => {}
     }
 
     Ok(())
-}
-
-fn reset_terminal() -> TuiError<()> {
-    disable_raw_mode()?;
-    execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
-    Ok(())
-}
-
-fn run_app<B: Backend>(
-    terminal: &mut Terminal<B>,
-    mut app: App,
-    tick_rate: Duration,
-) -> Result<(), Error> {
-    let mut last_tick = Instant::now();
-    for tab in app.tabs.iter_mut() {
-        if !tab.list.items.is_empty() {
-            tab.list.state.select(Some(0))
-        }
-    }
-    loop {
-        terminal
-            .draw(|f| ui(f, &mut app))
-            .map_err(|e| Error::UnexpectedError(e.into()))?;
-
-        let timeout = tick_rate
-            .checked_sub(last_tick.elapsed())
-            .unwrap_or_else(|| Duration::from_secs(0));
-
-        if crossterm::event::poll(timeout).map_err(|e| Error::UnexpectedError(e.into()))? {
-            if let Event::Key(KeyEvent {
-                code,
-                modifiers,
-                kind: _,
-                state: _,
-            }) = event::read().map_err(|e| Error::UnexpectedError(e.into()))?
-            {
-                match app.input_mode {
-                    InputMode::Editing => match (code, modifiers) {
-                        (KeyCode::Char('c'), KeyModifiers::CONTROL) => return Ok(()),
-                        (KeyCode::Esc, KeyModifiers::NONE) => app.input_mode = InputMode::Command,
-                        (KeyCode::Char('j'), KeyModifiers::CONTROL)
-                        | (KeyCode::Down, KeyModifiers::NONE) => app.tabs[app.curr_tab].list.next(),
-                        (KeyCode::Char('k'), KeyModifiers::CONTROL)
-                        | (KeyCode::Up, KeyModifiers::NONE) => {
-                            app.tabs[app.curr_tab].list.previous()
-                        }
-                        (KeyCode::Char('d'), KeyModifiers::CONTROL)
-                        | (KeyCode::Down, KeyModifiers::CONTROL) => {
-                            app.tabs[app.curr_tab].list.scroll_down()
-                        }
-                        (KeyCode::Char('u'), KeyModifiers::CONTROL)
-                        | (KeyCode::Up, KeyModifiers::CONTROL) => {
-                            app.tabs[app.curr_tab].list.scroll_up()
-                        }
-                        (KeyCode::Char(c), KeyModifiers::NONE) => app.enter_char(c),
-                        (KeyCode::Char(c), KeyModifiers::SHIFT) => {
-                            app.enter_char(c.to_ascii_uppercase())
-                        }
-                        (KeyCode::Backspace, KeyModifiers::NONE) => app.del_char(),
-                        (KeyCode::Enter, KeyModifiers::NONE) => {
-                            if let Some(path) = app.get_selected() {
-                                if app.curr_tab == 0 {
-                                    start_tmux(&path)?;
-                                } else {
-                                    switch_sessions(&path)?;
-                                }
-                                return Ok(());
-                            }
-                        }
-                        (KeyCode::Delete, KeyModifiers::NONE)
-                        | (KeyCode::Char('x'), KeyModifiers::CONTROL) => {
-                            if app.curr_tab == 1 {
-                                app.input_mode = InputMode::Command;
-                                app.message =
-                                    Line::from("Are you sure you want to kill this session? y/n")
-                            }
-                        }
-                        (KeyCode::Tab, KeyModifiers::NONE)
-                        | (KeyCode::Left, KeyModifiers::NONE)
-                        | (KeyCode::Right, KeyModifiers::NONE) => {
-                            if app.curr_tab == 0 {
-                                app.curr_tab = 1;
-                                app.message = HINT2.to_owned();
-                            } else {
-                                app.curr_tab = 0;
-                                app.message = HINT1.to_owned();
-                            }
-                        }
-                        _ => {}
-                    },
-                    InputMode::Command => match (code, modifiers) {
-                        (KeyCode::Char('y'), KeyModifiers::NONE) => {
-                            if let Some(session) = app.get_selected() {
-                                tmux::kill_session(&session)?;
-                                app.tabs[app.curr_tab].orignal_list = tmux::list_sessions()?;
-                                app.fzy_matcher_update_lists();
-                                if let Some(selected) = app.tabs[app.curr_tab].list.state.selected()
-                                {
-                                    let len = app.tabs[app.curr_tab].list.items.len();
-                                    if selected >= len {
-                                        app.tabs[app.curr_tab]
-                                            .list
-                                            .state
-                                            .select(Some(len.saturating_sub(1)))
-                                    }
-                                }
-                            }
-                            app.input_mode = InputMode::Editing;
-                            app.message = HINT1.to_owned();
-                        }
-                        (KeyCode::Char('n'), KeyModifiers::NONE) => {
-                            app.input_mode = InputMode::Editing;
-                            app.message = HINT2.to_owned();
-                        }
-                        (KeyCode::Esc, KeyModifiers::NONE) => return Ok(()),
-                        (KeyCode::Char('c'), KeyModifiers::CONTROL) => return Ok(()),
-                        _ => {}
-                    },
-                }
-            }
-        }
-        if last_tick.elapsed() >= tick_rate {
-            last_tick = Instant::now();
-        }
-    }
-}
-
-fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .margin(1)
-        .constraints(
-            [
-                Constraint::Min(3),
-                Constraint::Min(3),
-                Constraint::Percentage(100),
-            ]
-            .as_ref(),
-        )
-        .split(f.size());
-
-    let top = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(16), Constraint::Percentage(100)].as_ref())
-        .split(chunks[0]);
-
-    let tabs = get_tabs(app);
-    let items = get_items(app);
-    let input = get_inputs(app);
-    let message = get_message(app);
-
-    f.render_widget(tabs, top[0]);
-    f.render_widget(message, top[1]);
-    f.render_widget(input, chunks[1]);
-    if let InputMode::Editing = app.input_mode {
-        f.set_cursor(
-            chunks[1].x + app.cursor_position as u16 + 1,
-            // Move one line down, from the border to the input line
-            chunks[1].y + 1,
-        );
-    }
-    f.render_stateful_widget(items, chunks[2], &mut app.tabs[app.curr_tab].list.state);
-}
-
-fn get_message<'a>(app: &'a App) -> Paragraph<'a> {
-    Paragraph::new(app.message.to_owned())
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(AppColors::Border.get()))
-                .padding(Padding::new(2, 0, 0, 0))
-                .title("Info")
-                .title_style(Style::default().fg(AppColors::Border.get())),
-        )
-        .style(Style::default().fg(AppColors::Fg.get()))
-}
-
-fn get_tabs<'a>(app: &'a App) -> Tabs<'a> {
-    let titles = app.tabs.iter().map(|tab| Line::from(tab.name)).collect();
-
-    Tabs::new(titles)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(AppColors::Border.get()))
-                .title_style(Style::default().fg(AppColors::Border.get()))
-                .title("Sessions"),
-        )
-        .select(app.curr_tab)
-        .style(Style::default().fg(AppColors::Inactive.get()))
-        .highlight_style(
-            Style::default()
-                .add_modifier(Modifier::BOLD)
-                .fg(AppColors::Active.get()),
-        )
-}
-
-fn get_inputs<'a>(app: &'a App) -> Paragraph<'a> {
-    Paragraph::new(app.user_input.as_str())
-        .style(Style::default().fg(AppColors::Fg.get()))
-        .block(
-            Block::default()
-                .style(Style::default().fg(AppColors::Active.get()))
-                .borders(Borders::BOTTOM)
-                .border_style(Style::default().fg(AppColors::Border.get()))
-                .title(" Input")
-                .padding(Padding::new(1, 0, 0, 0)),
-        )
-}
-
-fn get_items<'a>(app: &App) -> List<'a> {
-    let items: Vec<ListItem> = app.tabs[app.curr_tab]
-        .list
-        .items
-        .iter()
-        .enumerate()
-        .filter_map(|(line_index, Item { path, indices })| {
-            if let Some(selected) = app.tabs[app.curr_tab].list.state.selected() {
-                let spans = path
-                    .chars()
-                    .enumerate()
-                    .map(|(char_index, char)| {
-                        let (fg, bg) = {
-                            let contains = indices.contains(&char_index);
-                            let focused = line_index == selected;
-                            match (focused, contains) {
-                                (true, true) => {
-                                    (AppColors::Selection.get(), AppColors::Active.get())
-                                }
-                                (true, false) => (Color::Black, AppColors::Active.get()),
-                                (false, true) => (AppColors::Selection.get(), Color::default()),
-                                (false, false) => (AppColors::Fg.get(), Color::default()),
-                            }
-                        };
-                        Span::styled(char.to_string(), Style::default().fg(fg).bg(bg))
-                    })
-                    .collect::<Vec<_>>();
-                Some(ListItem::new(Line::from(spans)))
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    List::new(items)
-        .block(
-            Block::default()
-                .padding(Padding::new(1, 5, 0, 0))
-                .title("Results")
-                .borders(Borders::LEFT)
-                .border_style(Style::default().fg(AppColors::Border.get()))
-                .style(Style::default().fg(AppColors::Active.get())),
-        )
-        .start_corner(Corner::TopLeft)
 }

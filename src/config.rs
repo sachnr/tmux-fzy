@@ -1,38 +1,91 @@
-use once_cell::sync::Lazy;
 use std::{
-    collections::HashMap,
     env,
     ffi::OsString,
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::PathBuf,
     str::FromStr,
-    sync::Mutex,
 };
 
 use ratatui::style::Color;
-use walkdir::WalkDir;
 
-use crate::Error;
-
-#[derive(Debug)]
-pub struct Paths(pub HashMap<String, Flags>);
-
-#[derive(Debug)]
-pub struct Flags {
+pub struct Entry {
+    pub path: PathBuf,
     pub min_depth: usize,
     pub max_depth: usize,
 }
 
-impl Paths {
-    pub fn insert_row(&mut self, path: String, min_depth: usize, max_depth: usize) {
-        self.0.entry(path).or_insert(Flags {
+pub struct PathList {
+    pub entries: Vec<Entry>,
+}
+
+pub struct Colors {
+    pub fg: Color,
+    pub border: Color,
+    pub inactive: Color,
+    pub active: Color,
+    pub selection: Color,
+}
+
+impl FromStr for PathList {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let mut entries = Vec::new();
+        for (i, line) in s.lines().enumerate() {
+            let values: Vec<&str> = line.split(":|:").collect();
+
+            if values.len() != 3 {
+                return Err(anyhow::anyhow!("Invalid number of values"));
+            }
+
+            let path = PathBuf::from_str(values[0]).map_err(|err| anyhow::anyhow!(err))?;
+            let min_depth: usize = values[1]
+                .parse()
+                .map_err(|_| anyhow::anyhow!("Error on line {}, invalid min_depth", i))?;
+            let max_depth: usize = values[2]
+                .parse()
+                .map_err(|_| anyhow::anyhow!("Error on line {}, invalid max_depth", i))?;
+
+            if path.is_dir() {
+                let path = PathBuf::from_str(values[0])?;
+                entries.push(Entry {
+                    path,
+                    min_depth,
+                    max_depth,
+                })
+            }
+        }
+        Ok(PathList { entries })
+    }
+}
+
+impl ToString for PathList {
+    fn to_string(&self) -> String {
+        self.entries
+            .iter()
+            .map(|entry| {
+                format!(
+                    "{}:|:{}:|:{}",
+                    entry.path.to_str().unwrap(),
+                    entry.min_depth,
+                    entry.max_depth
+                )
+            })
+            .collect::<Vec<String>>()
+            .join("\n")
+    }
+}
+
+impl PathList {
+    pub fn insert_row(&mut self, path: PathBuf, min_depth: usize, max_depth: usize) {
+        self.entries.push(Entry {
+            path,
             min_depth,
             max_depth,
-        });
+        })
     }
 
-    pub fn save_configuration(&self) -> Result<(), Error> {
+    pub fn save_configuration(&self) -> Result<(), anyhow::Error> {
         let paths_dir = get_paths_dir(".cache")
             .ok_or(anyhow::anyhow!("Failed to locate the config directory."))?;
         let file_path = paths_dir.join(".tmux-fzy");
@@ -44,172 +97,28 @@ impl Paths {
             .write(true)
             .truncate(true)
             .open(file_path)
-            .map_err(|e| Error::UnexpectedError(e.into()))?;
+            .map_err(|e| anyhow::anyhow!(e))?;
 
         file.write_all(c.as_bytes())
-            .map_err(|e| Error::UnexpectedError(e.into()))?;
+            .map_err(|e| anyhow::anyhow!(e))?;
 
         Ok(())
     }
 
-    pub fn expand_paths(&self) -> Vec<String> {
-        let mut dirs = Vec::new();
-        for (
-            path,
-            Flags {
-                min_depth,
-                max_depth,
-            },
-        ) in self.0.iter()
-        {
-            let directories = WalkDir::new(path)
-                .min_depth(*min_depth)
-                .max_depth(*max_depth)
-                .into_iter()
-                .filter_map(|entry| {
-                    let entry = entry.ok()?;
-                    let path = entry.path().to_owned();
-                    if entry.file_type().is_dir() {
-                        Some(path.to_str().unwrap().to_owned())
-                    } else {
-                        None
-                    }
-                });
-            dirs.extend(directories);
-        }
-        dirs
+    pub fn remove_paths(&mut self, path: Vec<PathBuf>) -> Result<(), anyhow::Error> {
+        self.entries.retain(|entry| !path.contains(&entry.path));
+        Ok(())
     }
-}
-
-impl FromStr for Paths {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let mut map = HashMap::new();
-        for (i, line) in s.lines().enumerate() {
-            let values: Vec<&str> = line.split(":|:").collect();
-
-            if values.len() != 3 {
-                return Err("Invalid number of values".into());
-            }
-
-            let _ = PathBuf::from_str(values[1])
-                .map_err(|_| format!("Error on line {}, invalid path", i))?;
-            let min_depth: usize = values[1]
-                .parse()
-                .map_err(|_| format!("Error on line {}, invalid min_depth", i))?;
-            let max_depth: usize = values[2]
-                .parse()
-                .map_err(|_| format!("Error on line {}, invalid max_depth", i))?;
-            map.entry(values[0].to_string()).or_insert(Flags {
-                min_depth,
-                max_depth,
-            });
-        }
-        Ok(Paths(map))
-    }
-}
-
-impl ToString for Paths {
-    fn to_string(&self) -> String {
-        self.0
-            .iter()
-            .map(|(key, value)| format!("{}:|:{}:|:{}", key, value.min_depth, value.max_depth))
-            .collect::<Vec<String>>()
-            .join("\n")
-    }
-}
-
-pub fn is_absolute_path(path: OsString) -> Option<PathBuf> {
-    let path = PathBuf::from(path);
-    if path.is_absolute() {
-        Some(path)
-    } else {
-        None
-    }
-}
-
-pub fn get_paths_dir(from_home: &str) -> Option<PathBuf> {
-    env::var_os("XDG_CACHE_HOME")
-        .and_then(is_absolute_path)
-        .or_else(|| {
-            env::var_os("HOME")
-                .map(PathBuf::from)
-                .map(|h| h.join(from_home))
-        })
-}
-
-pub fn init_config(path: &PathBuf) -> Result<(), anyhow::Error> {
-    let dir = path.parent().unwrap();
-    if !dir.exists() {
-        fs::create_dir(dir).map_err(|e| anyhow::anyhow!(e))?;
-    }
-    File::create(path).map_err(|e| anyhow::anyhow!(e))?;
-    Ok(())
-}
-
-pub fn get_paths() -> Result<Paths, Error> {
-    let config_dir =
-        get_paths_dir(".cache").ok_or(anyhow::anyhow!("Failed to locate the config directory."))?;
-
-    let file_path = config_dir.join(".tmux-fzy");
-    if !file_path.exists() {
-        init_config(&file_path)?;
-    }
-
-    let mut file = File::open(&file_path).map_err(|e| Error::UnexpectedError(e.into()))?;
-    let mut contents = String::new();
-    file.read_to_string(&mut contents)
-        .map_err(|e| Error::UnexpectedError(e.into()))?;
-    let paths = Paths::from_str(&contents).map_err(Error::ParseError)?;
-    Ok(paths)
-}
-
-struct Colors {
-    fg: Color,
-    border: Color,
-    inactive: Color,
-    active: Color,
-    selection: Color,
 }
 
 impl Colors {
-    fn new() -> Colors {
+    fn default() -> Colors {
         Colors {
             fg: Color::White,
             border: Color::White,
             inactive: Color::DarkGray,
             active: Color::Red,
             selection: Color::Green,
-        }
-    }
-
-    fn border(&mut self, border: u8) {
-        if let Some(value) = int_to_ansi_colors(border) {
-            self.border = value;
-        }
-    }
-
-    fn inactive(&mut self, inactive: u8) {
-        if let Some(value) = int_to_ansi_colors(inactive) {
-            self.inactive = value;
-        }
-    }
-
-    fn active(&mut self, active: u8) {
-        if let Some(value) = int_to_ansi_colors(active) {
-            self.active = value;
-        }
-    }
-
-    fn selection(&mut self, selection: u8) {
-        if let Some(value) = int_to_ansi_colors(selection) {
-            self.selection = value;
-        }
-    }
-
-    fn fg(&mut self, fg: u8) {
-        if let Some(value) = int_to_ansi_colors(fg) {
-            self.fg = value;
         }
     }
 }
@@ -236,8 +145,53 @@ fn int_to_ansi_colors(i: u8) -> Option<Color> {
     }
 }
 
-fn get_or_init_config() -> Colors {
-    let mut colors = Colors::new();
+fn is_absolute_path(path: OsString) -> Option<PathBuf> {
+    let path = PathBuf::from(path);
+    if path.is_absolute() {
+        Some(path)
+    } else {
+        None
+    }
+}
+
+fn get_paths_dir(from_home: &str) -> Option<PathBuf> {
+    env::var_os("XDG_CACHE_HOME")
+        .and_then(is_absolute_path)
+        .or_else(|| {
+            env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|h| h.join(from_home))
+        })
+}
+
+fn init_config(path: &PathBuf) -> Result<(), anyhow::Error> {
+    let dir = path.parent().unwrap();
+    if !dir.exists() {
+        fs::create_dir(dir).map_err(|e| anyhow::anyhow!(e))?;
+    }
+    File::create(path).map_err(|e| anyhow::anyhow!(e))?;
+    Ok(())
+}
+
+pub fn get_paths() -> Result<PathList, anyhow::Error> {
+    let config_dir =
+        get_paths_dir(".cache").ok_or(anyhow::anyhow!("Failed to locate the config directory."))?;
+
+    let file_path = config_dir.join(".tmux-fzy");
+    if !file_path.exists() {
+        init_config(&file_path)?;
+    }
+
+    let mut file = File::open(&file_path).map_err(|e| anyhow::anyhow!(e))?;
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let paths = PathList::from_str(&contents).map_err(|e| anyhow::anyhow!(e))?;
+    Ok(paths)
+}
+
+pub fn init_colors() -> Colors {
+    let mut colors = Colors::default();
     let config_dir = {
         if let Some(path) = get_paths_dir(".config/tmux-fzy") {
             path
@@ -252,10 +206,9 @@ fn get_or_init_config() -> Colors {
     }
 
     let mut file = {
-        if let Ok(file) = File::open(&file_path) {
-            file
-        } else {
-            return colors;
+        match File::open(&file_path) {
+            Ok(file) => file,
+            Err(_) => return colors,
         }
     };
 
@@ -269,48 +222,24 @@ fn get_or_init_config() -> Colors {
             continue;
         }
         let parts = line.split_once('=');
-        match parts {
-            Some((name, val)) => {
-                let name = name.trim();
-                let val = val.trim();
-                if let Ok(value) = val.parse::<u8>() {
+        if let Some((name, val)) = parts {
+            let name = name.trim();
+            let val = val.trim();
+            if let Ok(value) = val.parse::<u8>() {
+                let value = int_to_ansi_colors(value);
+                if let Some(value) = value {
                     match name {
-                        "fg" => colors.fg(value),
-                        "border" => colors.border(value),
-                        "inactive" => colors.inactive(value),
-                        "active" => colors.active(value),
-                        "selection" => colors.selection(value),
-                        _ => continue,
+                        "fg" => colors.fg = value,
+                        "border" => colors.border = value,
+                        "inactive" => colors.inactive = value,
+                        "active" => colors.active = value,
+                        "selection" => colors.selection = value,
+                        _ => {}
                     }
-                } else {
-                    continue;
                 }
             }
-            None => continue,
         }
     }
 
     colors
-}
-
-static CONFIG: Lazy<Mutex<Colors>> = Lazy::new(|| Mutex::new(get_or_init_config()));
-
-pub enum AppColors {
-    Fg,
-    Border,
-    Active,
-    Inactive,
-    Selection,
-}
-
-impl AppColors {
-    pub fn get(&self) -> Color {
-        match self {
-            AppColors::Fg => CONFIG.lock().unwrap().fg,
-            AppColors::Border => CONFIG.lock().unwrap().border,
-            AppColors::Active => CONFIG.lock().unwrap().active,
-            AppColors::Inactive => CONFIG.lock().unwrap().inactive,
-            AppColors::Selection => CONFIG.lock().unwrap().selection,
-        }
-    }
 }
