@@ -4,7 +4,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, List, ListDirection, ListItem, Padding, Paragraph};
 
 use crate::config::Colors;
-use crate::tui::PathItem;
+use crate::tui::{PathItem, Spinner};
 
 pub fn get_input_bar<'a>(input: &'a String, colors: &'a Colors) -> Paragraph<'a> {
     let inputs: Vec<Span<'a>> = vec![
@@ -40,16 +40,17 @@ pub fn get_list<'a>(
                 style.add_modifier = Modifier::BOLD;
             }
             let mut curr_pos: usize = 0;
+            let item_len = item.path.len();
             for ind in &item.indices {
                 spans.push(Span::styled(&item.path[curr_pos..*ind], style));
-                curr_pos = ind + 1;
                 spans.push(Span::styled(
-                    &item.path[*ind..curr_pos],
+                    &item.path[*ind..=*ind],
                     style.fg(colors.selection),
                 ));
+                curr_pos = ind + 1;
             }
-            if curr_pos < item.path.len() - 1 {
-                spans.push(Span::styled(&item.path[curr_pos..item.path.len()], style));
+            if curr_pos < item_len {
+                spans.push(Span::styled(&item.path[curr_pos..item_len], style));
             }
             let line = Line::from(spans);
             ListItem::new(line)
@@ -68,7 +69,18 @@ pub fn get_list<'a>(
         .direction(ListDirection::TopToBottom)
 }
 
-pub fn get_total_item_no(total_len: usize, curr_len: usize, colors: &Colors) -> Paragraph<'_> {
-    let text = format!("{}/{}", curr_len, total_len);
+pub fn get_total_item_no<'a>(
+    total_len: usize,
+    curr_len: usize,
+    colors: &Colors,
+    spinner: &'a mut Spinner,
+) -> Paragraph<'a> {
+    let spin = if spinner.visible {
+        spinner.tick();
+        spinner.get_curr()
+    } else {
+        ""
+    };
+    let text = format!("{}/{} {}", curr_len, total_len, spin);
     Paragraph::new(text).block(Block::default().fg(colors.selection))
 }

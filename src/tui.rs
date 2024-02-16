@@ -1,4 +1,4 @@
-use std::{collections::BinaryHeap, path::PathBuf, time::Duration};
+use std::{cell::Cell, collections::BinaryHeap, path::PathBuf, sync::mpsc, time::Duration};
 
 use crossterm::{
     event::{KeyCode, KeyEvent, KeyModifiers},
@@ -6,16 +6,14 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use fuzzy_matcher::FuzzyMatcher;
-use jwalk::{
-    rayon::iter::{IntoParallelRefIterator, ParallelBridge, ParallelIterator},
-    WalkDir,
-};
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
     widgets::ListState,
     Frame, Terminal,
 };
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+use walkdir::WalkDir;
 
 use crate::{
     config::{Colors, PathList},
@@ -44,18 +42,35 @@ struct App<'a> {
     total_items: usize,
     colors: Colors,
     list: StatefulList<'a>,
+    spinner: Spinner,
+    loaded: bool,
+}
+
+pub struct Spinner {
+    pub visible: bool,
+    pub curr_frame: usize,
+    pub chars: [&'static str; 10],
 }
 
 type Term = Terminal<CrosstermBackend<std::io::Stdout>>;
 
 pub fn start_tui(paths: PathList, colors: Colors) -> Result<(), anyhow::Error> {
     let mut terminal = init_terminal()?;
-    let paths = expand_paths(paths);
-    let statefullist = StatefulList::from(&paths);
-    let mut app = App::new(statefullist, colors, paths.len());
+    let statefullist = StatefulList::default();
+    let mut app = App::new(statefullist, colors, 0);
+
+    let (tx, rx) = mpsc::channel();
+
+    let t1 = std::thread::spawn(move || {
+        let paths = expand_paths(paths);
+        _ = tx.send(paths);
+        drop(tx);
+    });
+
+    let paths: Cell<Vec<(String, String)>> = Cell::new(vec![]);
 
     while app.running {
-        let timeout = Duration::from_millis(200);
+        let timeout = Duration::from_millis(16);
         if crossterm::event::poll(timeout)? {
             match crossterm::event::read()? {
                 crossterm::event::Event::Key(KeyEvent {
@@ -109,7 +124,19 @@ pub fn start_tui(paths: PathList, colors: Colors) -> Result<(), anyhow::Error> {
             }
         }
         terminal.draw(|f| render_frame(f, &mut app))?;
+        if !app.loaded {
+            if let Ok(rx_paths) = rx.try_recv() {
+                paths.replace(rx_paths);
+                unsafe {
+                    app.list = StatefulList::from(&*paths.as_ptr());
+                    app.total_items = app.list.items.len();
+                };
+                app.spinner.visible = false;
+            }
+        }
     }
+
+    t1.join().unwrap();
 
     Ok(())
 }
@@ -131,7 +158,7 @@ fn render_frame(f: &mut Frame<'_>, app: &mut App) {
 
     let input_bar = get_input_bar(&app.input, &app.colors);
     let items = get_list(&app.list.items, rows, curr_row, &app.colors);
-    let status = get_total_item_no(app.total_items, items.len(), &app.colors);
+    let status = get_total_item_no(app.total_items, items.len(), &app.colors, &mut app.spinner);
 
     f.render_widget(input_bar, top[0]);
     f.render_widget(status, top[1]);
@@ -147,7 +174,6 @@ fn expand_paths(paths: PathList) -> Vec<(String, String)> {
             .min_depth(path.min_depth)
             .max_depth(path.max_depth)
             .into_iter()
-            .par_bridge()
             .filter_map(|item| {
                 let entry = item.ok()?;
                 let path = entry.path().to_owned();
@@ -217,6 +243,29 @@ impl<'a> PartialOrd for PathItem<'a> {
     }
 }
 
+impl Default for Spinner {
+    fn default() -> Self {
+        Spinner {
+            visible: true,
+            curr_frame: 0,
+            chars: ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"],
+        }
+    }
+}
+
+impl Spinner {
+    pub fn tick(&mut self) {
+        // update every 4 frame
+        self.curr_frame += 1;
+        if self.curr_frame == 39 {
+            self.curr_frame = 0;
+        }
+    }
+    pub fn get_curr(&self) -> &str {
+        self.chars[self.curr_frame / 4]
+    }
+}
+
 impl<'a> App<'a> {
     fn new(list: StatefulList<'a>, colors: Colors, len: usize) -> Self {
         App {
@@ -226,6 +275,8 @@ impl<'a> App<'a> {
             total_items: len,
             list,
             colors,
+            loaded: false,
+            spinner: Spinner::default(),
         }
     }
 
