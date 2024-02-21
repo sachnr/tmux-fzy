@@ -117,8 +117,8 @@ impl Colors {
             fg: Color::White,
             border: Color::White,
             inactive: Color::DarkGray,
-            active: Color::Red,
-            selection: Color::Green,
+            active: Color::LightGreen,
+            selection: Color::LightYellow,
         }
     }
 }
